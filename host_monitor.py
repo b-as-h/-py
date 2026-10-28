@@ -17,6 +17,7 @@ BASH-STM32 蓝牙上位机
 协议见 README「蓝牙串口协议」一节。
 """
 
+import math
 import queue
 import threading
 import time
@@ -30,10 +31,18 @@ except ImportError:  # pragma: no cover
     serial = None
     list_ports = None
 
+try:
+    import sysinfo          # 本机性能采集（纯 ctypes，无第三方依赖）
+except Exception:           # 采集模块不可用不影响串口功能
+    sysinfo = None
+
 BAUD_CHOICES = ["9600", "19200", "38400", "57600", "115200"]
 DEFAULT_BAUD = "9600"
 HISTORY = 120
 FLOAT_KEYS = ("temp", "chip", "roll", "pitch")
+RADAR_MAX_CM = 200          # 雷达视图量程，超过的点压在边缘
+RADAR_DPS = 60              # 雷达扫描角速度，与固件默认一致
+RADAR_TRAIL = 14            # 扫描线拖尾的条数
 
 BG = "#1b1b1f"
 PANEL = "#26262b"
@@ -41,6 +50,17 @@ FG = "#e6e6e6"
 MUTED = "#9a9aa2"
 ACCENT = "#5dcaa5"
 WARN = "#ef9f27"
+
+
+def _fmt_speed(kbs):
+    """KB/s 转紧凑显示。"""
+    try:
+        kbs = float(kbs)
+    except (TypeError, ValueError):
+        return "--"
+    if kbs >= 1024.0:
+        return "%.1fM" % (kbs / 1024.0)
+    return "%.0fK" % kbs
 
 
 class MonitorApp:
@@ -64,9 +84,30 @@ class MonitorApp:
         self.active_baud = 0        # 当前端口实际使用的波特率
         self.pending_baud = 0       # 等待设备确认的目标波特率
         self.baud_deadline = 0.0
+        self.radar_on = False       # 雷达模式是否开启
+        self.radar_angle = 0        # 最近一次收到的云台角度
+        self.radar_disp = 0.0       # 显示角度（浮点，做本地补间）
+        self.radar_prev = 0.0       # 上一帧显示角度，用来判断扫描方向
+        self.radar_last_dist = -1   # 最近一次收到的距离，-1 表示无回波
+        self.radar_pts = {}         # 角度(0-180) -> 距离(cm)
+
+        # ---- 电脑状态采集：程序一打开就开始，不依赖串口 ----
+        self.sys = None
+        self.pc_last = 0.0          # 上次推送电脑数据的时间
+        self.sys_last = 0.0         # 上次重绘圆环的时间
+        self.pc_err_noted = False   # 是否已提示过"固件不认识 PC 命令"
+        if sysinfo is not None:
+            try:
+                self.sys = sysinfo.Collector(interval=1.0)
+                self.sys.start()
+            except Exception:
+                self.sys = None
+
         self._build_ui()
         self._draw_gyro()
+        self._draw_radar()
         self.root.after(50, self._poll)
+        self.root.after(33, self._animate)
 
     # ---------- 界面 ----------
     def _build_ui(self):
@@ -87,6 +128,8 @@ class MonitorApp:
         style.configure("TCheckbutton", background=BG, foreground=FG)
         style.configure("TCombobox", fieldbackground=PANEL)
         style.configure("TEntry", fieldbackground=PANEL, foreground=FG)
+        # clam 主题自带的复选框指示器画的是一个"叉"，换成自己画的方框 + 对勾
+        self._install_dark_check(style)
 
         # ---- 顶部：串口 + 波特率 ----
         top = ttk.Frame(self.root, padding=(12, 10, 12, 6))
@@ -119,15 +162,37 @@ class MonitorApp:
         right = ttk.Frame(body, padding=(14, 0, 0, 0))
         right.pack(side="right", fill="y")
 
-        left = ttk.Frame(body)
-        left.pack(side="left", fill="both", expand=True)
+        # ---- 左栏（可滚动）----
+        # 内容高度超过窗口，用 Canvas + 内嵌 Frame 做垂直滚动，鼠标滚轮控制
+        scroll_host = ttk.Frame(body)
+        scroll_host.pack(side="left", fill="both", expand=True)
+
+        self.scroll = tk.Canvas(scroll_host, bg=BG, highlightthickness=0,
+                                yscrollincrement=24)
+        vbar = ttk.Scrollbar(scroll_host, orient="vertical", command=self.scroll.yview)
+        self.scroll.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        self.scroll.pack(side="left", fill="both", expand=True)
+
+        left = ttk.Frame(self.scroll)
+        self._left_win = self.scroll.create_window((0, 0), window=left, anchor="nw")
+        left.bind("<Configure>",
+                  lambda e: self.scroll.configure(scrollregion=self.scroll.bbox("all")))
+        self.scroll.bind("<Configure>",
+                         lambda e: self.scroll.itemconfigure(self._left_win, width=e.width))
+
+        # ---- 电脑状态（圆环）：程序打开即开始刷新，与串口是否连接无关 ----
+        ttk.Label(left, text="电脑状态", style="Muted.TLabel").pack(anchor="w", pady=(2, 2))
+        self.sys_canvas = tk.Canvas(left, height=148, bg=PANEL, highlightthickness=0)
+        self.sys_canvas.pack(fill="x")
+        self.sys_canvas.bind("<Configure>", lambda e: self._draw_sysinfo())
 
         grid = ttk.Frame(left)
         grid.pack(fill="x", pady=(0, 6))
         self.value_labels = {}
         fields = [
             ("光照", "light", "%"), ("温度", "temp", "℃"), ("湿度", "humi", "%"),
-            ("片内温度", "chip", "℃"), ("供电", "vdd", "mV"), ("舵机", "servo", "°"),
+            ("片内温度", "chip", "℃"), ("供电", "vdd", "mV"),
         ]
         for i, (name, key, unit) in enumerate(fields):
             cell = ttk.Frame(grid)
@@ -148,20 +213,28 @@ class MonitorApp:
 
         ttk.Label(left, text="温度曲线 / 陀螺仪", style="Muted.TLabel").pack(anchor="w", pady=(6, 2))
 
+        # 两块画布给同一个高度，左右顶边才会严格对齐（之前 Notebook 的标签栏
+        # 会把温度曲线整体压下去，和右边的陀螺仪错开二十多像素）
+        chart_h = 180
         charts = ttk.Frame(left)
-        charts.pack(fill="both", expand=True)
+        charts.pack(fill="x")
 
-        chart_col = ttk.Frame(charts)
-        chart_col.pack(side="left", fill="both", expand=True)
-        self.canvas = tk.Canvas(chart_col, height=160, bg=PANEL, highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(charts, height=chart_h, bg=PANEL, highlightthickness=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
 
         gyro_col = ttk.Frame(charts, padding=(12, 0, 0, 0))
         gyro_col.pack(side="right", fill="y")
-        self.gyro = tk.Canvas(gyro_col, width=300, height=160, bg=PANEL,
+        self.gyro = tk.Canvas(gyro_col, width=300, height=chart_h, bg=PANEL,
                               highlightthickness=0)
         self.gyro.pack(fill="both", expand=True)
         self.gyro.bind("<Configure>", lambda e: self._draw_gyro())
+
+        # 雷达图单独占一块，放在温度曲线下方，靠滚轮往下滚才能看到
+        ttk.Label(left, text="雷达", style="Muted.TLabel").pack(anchor="w", pady=(10, 2))
+        self.radar = tk.Canvas(left, height=260, bg=PANEL, highlightthickness=0)
+        self.radar.pack(fill="x")
+        self.radar.bind("<Configure>", lambda e: self._draw_radar())
+        self.root.bind_all("<MouseWheel>", self._on_wheel)
 
         # ---- 右侧控制 ----
         ttk.Label(right, text="舵机角度").pack(anchor="w")
@@ -180,6 +253,16 @@ class MonitorApp:
         self.stream_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(right, text="周期遥测 500ms", variable=self.stream_var,
                         command=self._send_stream).pack(anchor="w", pady=1)
+
+        self.radar_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(right, text=f"雷达模式 {RADAR_DPS}°/s", variable=self.radar_var,
+                        command=self._send_radar).pack(anchor="w", pady=1)
+
+        self.pcdata_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(right, text="发送电脑数据 1s", variable=self.pcdata_var,
+                        command=self._toggle_pcdata).pack(anchor="w", pady=1)
+        ttk.Label(right, text="把电脑状态每秒推给 STM32",
+                  style="Muted.TLabel", justify="left").pack(anchor="w", pady=(0, 0))
 
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
 
@@ -222,7 +305,7 @@ class MonitorApp:
         self.hex_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(opts, text="HEX 发送", variable=self.hex_var).pack(side="left", padx=(14, 0))
 
-        self.ts_var = tk.BooleanVar(value=False)
+        self.ts_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="时间戳", variable=self.ts_var).pack(side="left", padx=(14, 0))
 
         self.timer_var = tk.BooleanVar(value=False)
@@ -241,6 +324,56 @@ class MonitorApp:
 
         # 串口枚举放在最后：它可能触发日志输出，此时所有控件必须已就绪
         self._refresh_ports()
+
+    def _install_dark_check(self, style):
+        """把 ttk.Checkbutton 的指示器换成自绘的深色方框 + 对勾。
+
+        clam 主题默认用一条交叉线表示"选中"，在深色界面上看起来就是个叉，
+        容易误读成"未选中/错误"。这里直接生成两张 14x14 的位图做指示器。
+        """
+        def box(color):
+            img = tk.PhotoImage(width=14, height=14)
+            img.put(PANEL, to=(0, 0, 14, 14))
+            for i in range(14):
+                img.put(color, (i, 0))
+                img.put(color, (i, 13))
+                img.put(color, (0, i))
+                img.put(color, (13, i))
+            return img
+
+        off = box("#4a4a52")
+        on = box(ACCENT)
+        for x, y in [(2, 7), (3, 8), (4, 9), (5, 10), (6, 9), (7, 8),
+                     (8, 7), (9, 6), (10, 5), (11, 4)]:
+            on.put(ACCENT, (x, y))
+            on.put(ACCENT, (x, y - 1))
+
+        self._ck_images = (off, on)   # 必须留引用，否则图片会被回收
+        try:
+            style.element_create("Dark.Check.indicator", "image", off,
+                                 ("selected", on), border=0, sticky="")
+        except tk.TclError:
+            return                     # 已经创建过（多实例场景）
+        style.layout("TCheckbutton", [
+            ("Checkbutton.padding", {"sticky": "nswe", "children": [
+                ("Dark.Check.indicator", {"side": "left", "sticky": ""}),
+                ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [
+                    ("Checkbutton.label", {"sticky": "nswe"})]})]})])
+
+    def _on_wheel(self, event):
+        """鼠标滚轮只在指针位于左栏时滚动左栏，避免和日志框抢事件。"""
+        c = self.scroll
+        if not c.winfo_ismapped():
+            return
+        px, py = c.winfo_pointerxy()
+        if (c.winfo_rootx() <= px <= c.winfo_rootx() + c.winfo_width()
+                and c.winfo_rooty() <= py <= c.winfo_rooty() + c.winfo_height()):
+            c.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def _scroll_to_radar(self):
+        """把左栏滚到底，让雷达图露出来。"""
+        self.scroll.update_idletasks()
+        self.scroll.yview_moveto(1.0)
 
     def _refresh_ports(self):
         if list_ports is None:
@@ -415,6 +548,136 @@ class MonitorApp:
     def _send_stream(self):
         self._send(f"STREAM,{1 if self.stream_var.get() else 0},500")
 
+    def _send_radar(self):
+        if self.radar_var.get():
+            self.radar_pts.clear()
+            self.radar_angle = 0
+            self.radar_disp = 0.0
+            self.radar_prev = 0.0
+            self.radar_last_dist = -1
+            self.radar_on = True
+            self._scroll_to_radar()      # 滚到底，让雷达图露出来
+            self._send(f"RADAR,1,{RADAR_DPS}")
+        else:
+            self.radar_on = False
+            self._send("RADAR,0")
+        self._draw_radar()
+
+    # ---------- 电脑数据 ----------
+    def _toggle_pcdata(self):
+        if self.pcdata_var.get():
+            self.pc_last = 0.0
+            self.pc_err_noted = False
+            if self.ser is None:
+                self._log("! 未连接：连上后会自动开始推送电脑数据")
+            else:
+                self._log("> 开始推送电脑数据（1s 一帧）")
+        else:
+            self._log("> 已停止推送电脑数据")
+
+    def _pc_payload(self):
+        """拼一帧电脑数据，全整数，MCU 端用 atoi/sscanf 就能解，不用解析浮点。
+
+        PC,cpu=42,mem=63,gpu=21,ct=42,gt=49,cf=4000,gc=608,
+           ru=102,rt=160,dn=806,up=41,fps=75
+
+        ct / gt / gc 为 -1 表示这台机器读不到（没装 HWiNFO）
+        ru / rt      单位 0.1GB（102 表示 10.2GB）
+        dn / up      单位 KB/s
+        """
+        d = self.sys.snapshot() if self.sys is not None else None
+        if d is None:
+            return "PC,cpu=0,mem=0,gpu=-1,ct=-1,gt=-1,cf=-1,gc=-1,ru=0,rt=0,dn=0,up=0,fps=-1"
+
+        def i(v):
+            try:
+                return int(round(float(v)))
+            except (TypeError, ValueError):
+                return -1
+
+        return ("PC,cpu=%d,mem=%d,gpu=%d,ct=%d,gt=%d,cf=%d,gc=%d,"
+                "ru=%d,rt=%d,dn=%d,up=%d,fps=%d") % (
+                    i(d["cpu"]), i(d["mem"]), i(d["gpu"]),
+                    i(d["cpu_temp"]), i(d["gpu_temp"]),
+                    i(d["cpu_mhz"]), i(d["gpu_mhz"]),
+                    i(d["ram_used"] * 10), i(d["ram_total"] * 10),
+                    i(d["net_down"]), i(d["net_up"]), i(d["fps"]))
+
+    def _draw_sysinfo(self):
+        """五个圆环：CPU / GPU / RAM / NET / FPS。"""
+        c = self.sys_canvas
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 150 or h < 80:
+            return
+
+        d = self.sys.snapshot() if self.sys is not None else None
+        if d is None:
+            c.create_text(w / 2, h / 2, text="采集模块不可用",
+                          fill=MUTED, font=("Consolas", 10))
+            return
+
+        def clamp(v):
+            return max(0.0, min(100.0, float(v)))
+
+        cpu, mem, gpu = d["cpu"], d["mem"], d["gpu"]
+
+        def sub_of(*parts):
+            s = " ".join(p for p in parts if p)
+            return s if s else "--"
+
+        cpu_sub = sub_of("%d°C" % d["cpu_temp"] if d["cpu_temp"] >= 0 else "",
+                         "%.2fG" % (d["cpu_mhz"] / 1000.0) if d["cpu_mhz"] > 0 else "")
+        gpu_sub = sub_of("%d°C" % d["gpu_temp"] if d["gpu_temp"] >= 0 else "",
+                         "%dM" % d["gpu_mhz"] if d["gpu_mhz"] > 0 else "")
+
+        net_total = d["net_down"] + d["net_up"]
+        # 网速用对数刻度，线性刻度下几 KB/s 在环上几乎看不见
+        net_ratio = math.log10(1 + net_total) / math.log10(1 + 10240) if net_total > 0 else 0.0
+
+        hz = d["hz"] if d["hz"] > 0 else 60.0
+        fps_ratio = clamp(d["fps"] / hz * 100.0) / 100.0 if d["fps"] >= 0 else 0.0
+
+        items = [
+            ("CPU", clamp(cpu) / 100.0, "%d%%" % cpu, cpu_sub, "#4ecdc4", 13),
+            ("GPU", clamp(gpu) / 100.0 if gpu >= 0 else 0.0,
+             "%d%%" % gpu if gpu >= 0 else "--", gpu_sub, "#ffa94d", 13),
+            ("RAM", clamp(mem) / 100.0, "%d%%" % mem,
+             "%.1f/%.0fG" % (d["ram_used"], d["ram_total"]), "#a78bfa", 13),
+            ("NET", min(1.0, net_ratio), "↓" + _fmt_speed(d["net_down"]),
+             "↑" + _fmt_speed(d["net_up"]) + "/s", "#6ee7b7", 11),
+            ("FPS", min(1.0, fps_ratio), "%d" % d["fps"] if d["fps"] >= 0 else "--",
+             "%dHz" % d["hz"] if d["hz"] > 0 else "--", "#e6e6e6", 15),
+        ]
+
+        slot = w / float(len(items))
+        r = 38.0
+        if h < 140:
+            r = max(22.0, (h - 46) / 2.0)
+        cy = 14 + 10 + r
+        sub_y = cy + r + 14
+
+        for idx, (name, ratio, center, sub, color, fsize) in enumerate(items):
+            cx = slot * (idx + 0.5)
+            box = (cx - r, cy - r, cx + r, cy + r)
+
+            c.create_text(cx, 14, text=name, fill=MUTED, font=("Consolas", 9))
+
+            # 底槽
+            c.create_oval(box[0], box[1], box[2], box[3],
+                          outline="#3a3a42", width=7)
+
+            # 进度弧：从 12 点方向顺时针
+            if ratio > 0.004:
+                c.create_arc(box[0], box[1], box[2], box[3],
+                             start=90, extent=-ratio * 359.9,
+                             style="arc", outline=color, width=7)
+
+            c.create_text(cx, cy, text=center, fill=FG,
+                          font=("Consolas", fsize, "bold"))
+            c.create_text(cx, sub_y, text=sub, fill=MUTED, font=("Consolas", 8))
+
     def _clear_log(self):
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
@@ -462,12 +725,36 @@ class MonitorApp:
                     else:
                         self._send(text)
 
+        # 电脑状态圆环：1s 重绘一次，跟采集节奏一致
+        if time.time() - self.sys_last >= 1.0:
+            self.sys_last = time.time()
+            self._draw_sysinfo()
+
+        # 电脑数据推送：勾选后每 1s 一帧。
+        # 用 _send_bytes 且不传 label，避免每秒往日志里写一行把有用信息冲掉
+        if self.pcdata_var.get() and self.ser is not None:
+            if time.time() - self.pc_last >= 1.0:
+                self.pc_last = time.time()
+                payload = (self._pc_payload() + "\r\n").encode("ascii", "ignore")
+                self._send_bytes(payload)
+
         self.root.after(50, self._poll)
 
     def _handle_line(self, line):
         if not line:
             return
-        self._log(f"< {line}")
+
+        # 老固件不认识 PC 命令，每秒会回一条 -ERR,UNKNOWN。
+        # 推送期间把这些回复吞掉，否则日志会被刷屏；只在第一次提示一句。
+        if line == "-ERR,UNKNOWN" and self.pcdata_var.get():
+            if not self.pc_err_noted:
+                self.pc_err_noted = True
+                self._log("! 固件暂不支持 PC 命令（回 -ERR,UNKNOWN），已自动忽略这些回复")
+            return
+
+        # $R 是 20Hz 的雷达帧，全写日志会把有用信息冲掉
+        if not line.startswith("$R,"):
+            self._log(f"< {line}")
 
         if line.startswith("+PONG"):
             self.await_pong = 0.0
@@ -478,6 +765,14 @@ class MonitorApp:
             self.pending_baud = 0
             self._log(f"设备已切到 {target}，正在重连 ...")
             self.root.after(250, self._reconnect_at_target)
+
+        if line.startswith("+OK,RADAR="):
+            on = line.endswith("1")
+            self.radar_on = on
+            self.radar_var.set(on)
+            if on:
+                self._scroll_to_radar()
+            self._draw_radar()
 
         if line.startswith("+DATA,"):
             for item in line[6:].split(","):
@@ -517,6 +812,25 @@ class MonitorApp:
                     return
                 self._refresh_values()
                 self._push_history(self.data["temp"])
+        elif line.startswith("$R,"):
+            parts = line[3:].split(",")
+            if len(parts) >= 2:
+                try:
+                    ang = int(parts[0])
+                    dist = int(parts[1])
+                except ValueError:
+                    return
+                self.radar_angle = max(0, min(180, ang))
+                self.radar_last_dist = dist
+                if dist >= 0:
+                    self.radar_pts[self.radar_angle] = dist
+                if not self.radar_on:
+                    self.radar_on = True
+                    self.radar_var.set(True)
+                    self.radar_disp = float(self.radar_angle)
+                    self.radar_prev = float(self.radar_angle)
+                    self._scroll_to_radar()
+                self._draw_radar()
         elif line.startswith("-ERR"):
             self._log(f"! 设备返回错误 {line}")
 
@@ -527,7 +841,6 @@ class MonitorApp:
         self.value_labels["humi"].configure(text=str(d["humi"]))
         self.value_labels["chip"].configure(text=f"{d['chip']:.1f}")
         self.value_labels["vdd"].configure(text=str(d["vdd"]))
-        self.value_labels["servo"].configure(text=str(d["servo"]))
         self.acc_label.configure(
             text=f"ax {d['ax']/1000:.2f}   ay {d['ay']/1000:.2f}   az {d['az']/1000:.2f}")
         self.got_data = True
@@ -587,6 +900,97 @@ class MonitorApp:
                 c.create_line(mid, y, ex, y, fill=color, width=6)
             c.create_text(w - 5, y, text=f"{val:+d}", fill=FG, anchor="e",
                           font=("Consolas", 9))
+
+    @staticmethod
+    def _blend(c_from, c_to, t):
+        """两个 #rrggbb 颜色按 t（0~1）线性插值。Tk 画布没有透明度，用这个模拟渐隐。"""
+        t = max(0.0, min(1.0, t))
+        a = [int(c_from[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(c_to[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+    def _animate(self):
+        """雷达扫描的本地补间。
+
+        固件按 20Hz 回 $R，如果只在收到帧时才重画，扫描线是"跳"的。
+        这里以 30fps 把显示角度逐步追向最新角度，视觉上才是连续转动。
+        """
+        if self.radar_on:
+            diff = self.radar_angle - self.radar_disp
+            if abs(diff) > 0.15:
+                self.radar_prev = self.radar_disp
+                self.radar_disp += diff * 0.45
+                self._draw_radar()
+        self.root.after(33, self._animate)
+
+    def _draw_radar(self):
+        """半圆雷达：0° 在左、90° 朝上、180° 在右。
+
+        扫描线由 _animate() 补间到 30fps，身后留一段渐隐拖尾。
+        """
+        c = self.radar
+        c.delete("all")
+        w = max(c.winfo_width(), 220)
+        h = max(c.winfo_height(), 110)
+
+        # 半径要给刻度标签留位置：标签画在 r+10 处，90° 那个会顶到画布上沿
+        r = min(h - 40, (w - 64) / 2)
+        if r < 30:
+            c.create_text(w / 2, h / 2, text="视图太小", fill=MUTED)
+            return
+        cx = w / 2
+        cy = h - 18
+
+        # 距离环
+        for frac in (0.25, 0.5, 0.75, 1.0):
+            rr = r * frac
+            c.create_arc(cx - rr, cy - rr, cx + rr, cy + rr, start=0, extent=180,
+                         style="arc", outline="#33333a")
+
+        # 角度刻度线
+        for a in range(0, 181, 30):
+            th = math.radians(a)
+            c.create_line(cx, cy, cx - r * math.cos(th), cy - r * math.sin(th),
+                          fill="#2c2c33")
+            c.create_text(cx - (r + 10) * math.cos(th), cy - (r + 10) * math.sin(th),
+                          text=str(a), fill="#55555e", font=("Consolas", 8))
+
+        # 回波点
+        for ang, dist in self.radar_pts.items():
+            rr = r * min(dist / float(RADAR_MAX_CM), 1.0)
+            th = math.radians(ang)
+            x = cx - rr * math.cos(th)
+            y = cy - rr * math.sin(th)
+            color = ACCENT if dist < RADAR_MAX_CM * 0.6 else WARN
+            c.create_oval(x - 2, y - 2, x + 2, y + 2, fill=color, outline="")
+
+        # 扫描线拖尾：越靠后越接近背景色
+        sign = 1.0 if self.radar_disp >= self.radar_prev else -1.0
+        for k in range(RADAR_TRAIL, 0, -1):
+            a = self.radar_disp - sign * k * 1.6
+            if not 0 <= a <= 180:
+                continue
+            th = math.radians(a)
+            c.create_line(cx, cy, cx - r * math.cos(th), cy - r * math.sin(th),
+                          fill=self._blend(PANEL, ACCENT, 1.0 - k / float(RADAR_TRAIL + 1)))
+
+        # 当前扫描线
+        th = math.radians(self.radar_disp)
+        c.create_line(cx, cy, cx - r * math.cos(th), cy - r * math.sin(th),
+                      fill=ACCENT, width=2)
+        c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=ACCENT, outline="")
+
+        # 读数
+        c.create_text(8, 10, text=f"角度 {self.radar_disp:5.1f}°", fill=FG, anchor="w",
+                      font=("Microsoft YaHei UI", 10))
+        c.create_text(w - 8, 10, text=f"量程 {RADAR_MAX_CM}cm", fill=MUTED, anchor="e",
+                      font=("Consolas", 8))
+        dist_txt = f"{self.radar_last_dist} cm" if self.radar_last_dist >= 0 else "---"
+        c.create_text(8, h - 10, text=f"距离 {dist_txt}", fill=MUTED, anchor="w",
+                      font=("Microsoft YaHei UI", 9))
+
+        if not self.radar_pts:
+            c.create_text(cx, cy - r * 0.55, text="等待回波…", fill="#55555e")
 
     def _push_history(self, value):
         self.history.append(value)
