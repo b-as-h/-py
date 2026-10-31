@@ -13,7 +13,9 @@
 改了协议之后先跑一遍，再上硬件排查。
 """
 
+import math
 import sys
+import time
 import tkinter as tk
 
 import host_monitor as hm
@@ -227,6 +229,83 @@ def main():
     app._handle_line("-ERR,UNKNOWN")
     txt = app.log.get("1.0", "end")
     c.check("未推送时 -ERR 照常记录", "< -ERR,UNKNOWN" in txt, txt.strip())
+
+    print("[8] 3D 姿态仪：数据触发、缓动、异常与断连")
+    app.gyro_link = True
+    app.gyro_has_data = False
+    app._handle_line(
+        "+DATA,light=70,temp=24.5,humi=55,chip=30.1,vdd=3290,"
+        "ax=10,ay=-5,az=998,servo=90,lock=0,"
+        "gx=12,gy=-8,gz=28,roll=18.5,pitch=-7.2")
+    c.check("+DATA 更新姿态目标",
+            abs(app.gyro_target_roll - 18.5) < 1e-6
+            and abs(app.gyro_target_pitch + 7.2) < 1e-6,
+            (app.gyro_target_roll, app.gyro_target_pitch))
+    c.check("首帧直接对齐显示姿态",
+            abs(app.gyro_disp_roll - 18.5) < 1e-6,
+            app.gyro_disp_roll)
+    c.check("在线状态为 LIVE", app._gyro_status()[0] == "LIVE",
+            app._gyro_status())
+
+    base = time.monotonic()
+    app.gyro_anim_at = base
+    app._set_gyro_target(30, -10, 45, -20, 12)
+    old_roll = app.gyro_disp_roll
+    app._step_gyro(base + 0.033)
+    c.check("单帧 33ms 即产生可感知响应",
+            1.0 < abs(app.gyro_disp_roll - old_roll) < 38.5,
+            app.gyro_disp_roll - old_roll)
+    for i in range(1, 17):
+        app._step_gyro(base + i * 0.033)
+    c.check("约 0.5 秒平滑收敛到目标",
+            abs(app.gyro_disp_roll + 20) < 0.4
+            and abs(app.gyro_disp_pitch - 12) < 0.4,
+            (app.gyro_disp_roll, app.gyro_disp_pitch))
+
+    app.gyro_disp_roll = 179.0
+    app.gyro_anim_at = base + 1.0
+    app._set_gyro_target(0, 0, 0, -179, 0)
+    app._step_gyro(base + 1.033)
+    c.check("跨越 ±180° 时走最短方向",
+            app.gyro_disp_roll > 179.0,
+            app.gyro_disp_roll)
+
+    roll_before = app.gyro_target_roll
+    app._set_gyro_target(0, 0, 0, math.nan, 0)
+    c.check("NaN 姿态不污染目标",
+            app.gyro_target_roll == roll_before,
+            (app.gyro_target_roll, roll_before))
+    c.check("非法帧显示 DATA ERR",
+            app._gyro_status()[0] == "DATA ERR",
+            app._gyro_status())
+
+    app._set_gyro_target(0, 0, 0, 5, 5)
+    safe_roll = app.gyro_target_roll
+    try:
+        app._handle_line(
+            "+DATA,light=70,temp=24.5,humi=55,chip=30.1,vdd=3290,"
+            "ax=10,ay=-5,az=998,servo=90,lock=0,"
+            "gx=0,gy=0,gz=0,roll=nan,pitch=5")
+        parser_ok = True
+    except Exception:  # noqa: BLE001
+        parser_ok = False
+    c.check("+DATA 中的 NaN 不抛异常", parser_ok, parser_ok)
+    c.check("+DATA 中的 NaN 保留上一目标",
+            app.gyro_target_roll == safe_roll,
+            (app.gyro_target_roll, safe_roll))
+
+    app._set_gyro_target(0, 0, 0, 270, 120)
+    c.check("横滚归一化且俯仰钳位",
+            abs(app.gyro_target_roll + 90) < 1e-6
+            and app.gyro_target_pitch == 90,
+            (app.gyro_target_roll, app.gyro_target_pitch))
+
+    app.gyro_last_rx = time.monotonic() - hm.GYRO_STALE_S - 0.2
+    c.check("超过 2 秒无帧显示 HOLD",
+            app._gyro_status()[0] == "HOLD", app._gyro_status())
+    app.gyro_link = False
+    c.check("断连显示 OFFLINE",
+            app._gyro_status()[0] == "OFFLINE", app._gyro_status())
 
     root.destroy()
     return c.summary()

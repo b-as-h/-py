@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 """用固定虚拟数据生成 README 展示截图。
 
-不读取真实串口、本机性能或 HWiNFO，三张图可稳定复现：
+不读取真实串口、本机性能或 HWiNFO，四张图可稳定复现：
     screenshot.png                 主界面
-    screenshots/trends.png         温度曲线 + 陀螺仪
+    screenshots/trends.png         温度曲线 + 3D 姿态仪
     screenshots/radar.png          雷达扫描
+    screenshots/gyro.png           3D 姿态仪特写
 
 用法（Windows，屏幕工作区至少 1400x1020）：
     python tools/capture_screenshots.py
@@ -93,14 +94,55 @@ def save_png(path, width, height, bgra):
 
 def capture_client(root, path):
     """截取 Tk 客户区，不包含 Windows 标题栏。"""
-    user32 = ctypes.windll.user32
-    gdi32 = ctypes.windll.gdi32
     root.update_idletasks()
     root.update()
     time.sleep(0.12)
     root.update()
+    hwnd = ctypes.windll.user32.GetAncestor(root.winfo_id(), 2)
+    _capture_handle(hwnd, path)
 
-    hwnd = user32.GetAncestor(root.winfo_id(), 2)
+
+def capture_widget(widget, path):
+    """直接截取任意 Tk 控件的屏幕区域，用于姿态仪特写。"""
+    widget.update_idletasks()
+    widget.update()
+    time.sleep(0.12)
+    widget.update()
+    x = widget.winfo_rootx()
+    y = widget.winfo_rooty()
+    width = widget.winfo_width()
+    height = widget.winfo_height()
+
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    hdc = user32.GetDC(0)
+    mem_dc = gdi32.CreateCompatibleDC(hdc)
+    bitmap = gdi32.CreateCompatibleBitmap(hdc, width, height)
+    gdi32.SelectObject(mem_dc, bitmap)
+    gdi32.BitBlt(mem_dc, 0, 0, width, height, hdc, x, y, 0x00CC0020)
+    _save_bitmap(mem_dc, bitmap, width, height, path)
+    gdi32.DeleteObject(bitmap)
+    gdi32.DeleteDC(mem_dc)
+    user32.ReleaseDC(0, hdc)
+
+
+def _save_bitmap(mem_dc, bitmap, width, height, path):
+    gdi32 = ctypes.windll.gdi32
+    info = _BitmapInfoHeader()
+    info.size = ctypes.sizeof(_BitmapInfoHeader)
+    info.width = width
+    info.height = height
+    info.planes = 1
+    info.bit_count = 32
+    buffer = ctypes.create_string_buffer(width * height * 4)
+    gdi32.GetDIBits(mem_dc, bitmap, 0, height, buffer, ctypes.byref(info), 0)
+    save_png(path, width, height, buffer.raw)
+    print(f"saved {path.relative_to(ROOT)} ({width}x{height})")
+
+
+def _capture_handle(hwnd, path):
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
     rect = wintypes.RECT()
     user32.GetClientRect(hwnd, ctypes.byref(rect))
     width, height = rect.right, rect.bottom
@@ -110,22 +152,10 @@ def capture_client(root, path):
     bitmap = gdi32.CreateCompatibleBitmap(hdc, width, height)
     gdi32.SelectObject(mem_dc, bitmap)
     gdi32.BitBlt(mem_dc, 0, 0, width, height, hdc, 0, 0, 0x00CC0020)
-
-    info = _BitmapInfoHeader()
-    info.size = ctypes.sizeof(_BitmapInfoHeader)
-    info.width = width
-    info.height = height
-    info.planes = 1
-    info.bit_count = 32
-    buffer = ctypes.create_string_buffer(width * height * 4)
-    gdi32.GetDIBits(mem_dc, bitmap, 0, height, buffer, ctypes.byref(info), 0)
-
-    save_png(path, width, height, buffer.raw)
-
+    _save_bitmap(mem_dc, bitmap, width, height, path)
     gdi32.DeleteObject(bitmap)
     gdi32.DeleteDC(mem_dc)
     user32.ReleaseDC(hwnd, hdc)
-    print(f"saved {path.relative_to(ROOT)} ({width}x{height})")
 
 
 def scroll_to(app, widget, margin=12):
@@ -143,6 +173,7 @@ def populate(app):
     app.ser = FakeSerial()
     app.active_baud = 115200
     app.await_pong = 0.0
+    app.gyro_link = True
     app.port_box["values"] = ("COM5  HC-05 (SPP)",)
     app.port_var.set("COM5  HC-05 (SPP)")
     app.baud_var.set("115200")
@@ -219,6 +250,16 @@ def main():
     capture_client(root, ROOT / "screenshot.png")
     scroll_to(app, app.chart_head, margin=4)
     capture_client(root, ROOT / "screenshots" / "trends.png")
+
+    # 特写使用更明显的 3/4 侧倾姿态，三轴方向更清晰。
+    app.gyro_disp_roll = 30.0
+    app.gyro_disp_pitch = -18.0
+    app.gyro_target_roll = 30.0
+    app.gyro_target_pitch = -18.0
+    app.gyro_last_rx = time.monotonic()
+    app._draw_gyro()
+    capture_widget(app.gyro, ROOT / "screenshots" / "gyro.png")
+
     scroll_to(app, app.radar_head, margin=4)
     capture_client(root, ROOT / "screenshots" / "radar.png")
 

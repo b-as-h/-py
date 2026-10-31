@@ -6,6 +6,9 @@
 - 固件协议：`Core/Src/bt.c`、`Core/Inc/bt.h`（固件工程不在本仓库）
 - 界面技术：Python + Tkinter，无前端构建步骤
 - 显示适配：Windows Per-Monitor V2 DPI，1080p / 2K 自适应
+- 当前版本：**v1.9.0**
+- 安装包：[STM32Host-Setup-1.9.0.exe](https://github.com/b-as-h/Host_computer-py/releases/download/v1.9.0/STM32Host-Setup-1.9.0.exe)
+- 发布说明：<https://github.com/b-as-h/Host_computer-py/releases/tag/v1.9.0>
 
 ---
 
@@ -17,9 +20,13 @@
 
 ![主界面](screenshot.png)
 
-### 温度曲线与陀螺仪
+### 温度曲线与 3D 姿态仪
 
-![温度曲线与陀螺仪](screenshots/trends.png)
+![温度曲线与 3D 姿态仪](screenshots/trends.png)
+
+### 3D 姿态仪特写
+
+![3D 姿态仪](screenshots/gyro.png)
 
 ### 雷达扫描
 
@@ -27,9 +34,25 @@
 
 ---
 
-## 一、快速开始
+## 一、安装与启动
 
-**双击 `run_host.bat`**，或双击桌面快捷方式「STM32 上位机」。
+### 方式一：安装包（推荐）
+
+1. 打开 [Releases](https://github.com/b-as-h/Host_computer-py/releases/latest)，下载
+   `STM32Host-Setup-1.9.0.exe`。
+2. 双击安装包。当前安装包未购买代码签名证书，Windows SmartScreen 可能提示
+   “Windows 已保护你的电脑”，点 **更多信息 → 仍要运行** 即可。
+3. 选择安装位置。默认安装到 `%LOCALAPPDATA%\Programs\STM32Host`，
+   按当前用户安装，**不需要管理员权限**；可保留“创建桌面快捷方式”。
+4. 安装完成后勾选“运行 STM32 Host 上位机”，或从桌面 / 开始菜单启动。
+5. 卸载：Windows **设置 → 应用 → 已安装的应用 → STM32 Host 上位机 → 卸载**，
+   或运行安装目录下的 `unins000.exe`。
+
+安装包已包含程序、图标和本说明，内置 Python 运行时，目标电脑无需安装 Python 或 pyserial。
+
+### 方式二：源码运行
+
+**双击 `run_host.bat`**，或双击桌面快捷方式「STM32 Host 上位机」。
 
 启动器会自动完成三件事：
 
@@ -40,6 +63,7 @@
 手动运行：
 
 ```bat
+python -m pip install -r requirements.txt
 python host_monitor.py
 ```
 
@@ -58,6 +82,24 @@ python selftest.py
 全部通过（退出码 0）再插板子。这样一旦上板出问题，就能确定是接线 / 波特率 / 供电，
 而不是软件解析。改完协议先跑它，是成本最低的回归测试。
 
+### 全功能前台自动化测试
+
+```bat
+python tools/system_test.py
+python tools/system_test.py --hold
+```
+
+测试会打开主界面和独立测试台，用虚拟串口、性能快照和遥测帧覆盖通信、控制、
+传感器、电脑状态、日志、异常恢复等模块。陀螺仪、温度曲线和雷达分别持续展示
+6.4s、5.6s、5.6s，期间验证数据更新、动画绘制和状态切换。
+
+运行结束自动生成：
+
+- [`docs/system_test_report.md`](docs/system_test_report.md)：按模块列出覆盖、观测值和结论
+- `test-results/system_test_results.json`：原始结果
+- `test-results/system_gyro.png`、`system_temperature.png`、`system_radar.png`：阶段证据
+- `test-results/system_test_hud.png`：测试台最终结果
+
 ### 重新生成展示截图
 
 ```bat
@@ -67,25 +109,48 @@ python tools/capture_screenshots.py
 脚本固定 Tk 缩放为 1.25，使用虚拟串口、性能快照和遥测数据，输出：
 
 - `screenshot.png`：主界面
-- `screenshots/trends.png`：温度曲线与陀螺仪
+- `screenshots/trends.png`：温度曲线与 3D 姿态仪
+- `screenshots/gyro.png`：3D 姿态仪特写
 - `screenshots/radar.png`：雷达扫描
 
 运行环境需要至少 1400×1020 的 Windows 桌面，不连接任何真实硬件。
 
-### 打包成 exe / 发布
+### 构建 exe 与安装包
 
 已发布仓库：<https://github.com/b-as-h/Host_computer-py>
 
-标准 Python 环境（需先安装 PyInstaller）：
+构建环境：Windows 10/11 64 位、Python 3.9+ 64 位、Inno Setup 7。
 
 ```bat
-python -m pip install pyinstaller
+python -m pip install -r requirements-dev.txt
+installer\build_installer.bat
+```
+
+脚本依次完成：
+
+1. 安装 pyserial 与 PyInstaller；
+2. PyInstaller 生成 `dist\STM32Host.exe`（单文件，含图标与 1.9.0 版本信息）；
+3. Inno Setup 编译 `installer\STM32Host.iss`，生成
+   `dist\STM32Host-Setup-1.9.0.exe`。
+
+只重新生成 exe：
+
+```bat
 pyinstaller --noconfirm --clean --onefile --windowed --icon app.ico ^
+  --version-file installer\version_info.txt ^
   --collect-all serial --name STM32Host host_monitor.py
 ```
 
-产物为 `dist\STM32Host.exe`。程序是单文件，运行时不需要 Python、源码目录或 `.workbuddy`。
+**工具选择**：PyInstaller 负责把 Python 程序和运行时打成单文件 exe；Inno Setup 7 负责安装层。
+相比 ZIP 或自解压包，Inno Setup 能生成标准 Windows 安装向导、开始菜单/桌面快捷方式、
+“应用和功能”卸载项和版本信息，并且默认按当前用户安装，不触发 UAC。
 
+> Inno Setup 7 下载：<https://jrsoftware.org/isdl.php>。安装脚本使用
+> `PrivilegesRequired=lowest`，默认目录为 `%LOCALAPPDATA%\Programs\STM32Host`；
+> `installer\build_installer.bat` 会自动查找 `ISCC.exe`。
+>
+> 安装包未做代码签名，SmartScreen 会提示未知发布者；正式分发前建议购买代码签名证书。
+>
 > conda 环境打包时，`_tkinter.pyd` 依赖的 `tcl90.dll` / `tcl9tk90.dll` 不会被自动收集，
 > 还需按原环境手动追加 `--add-binary "%CONDA_PREFIX%\Library\bin\..."`。
 > pyserial 使用 `--collect-all serial`，否则 exe 里可能检测不到串口。
@@ -99,8 +164,18 @@ pyinstaller --noconfirm --clean --onefile --windowed --icon app.ico ^
 | `sysinfo.py` | 本机性能采集（CPU/GPU/内存/网络/FPS/温度），纯 ctypes，可单独 `python sysinfo.py` 自测 |
 | `run_host.bat` | 启动器，负责选解释器、装依赖、拉起界面 |
 | `selftest.py` | 离线自检，不需要开发板和串口，验证协议解析是否正常 |
+| `tools/system_test.py` | 前台系统级自动化测试，覆盖长时可视化、边界与异常场景 |
 | `tools/capture_screenshots.py` | 用固定虚拟数据生成 README 展示截图 |
-| `dist/STM32Host.exe` | 打包好的单文件 exe，免安装直接双击运行（约 12 MB） |
+| `tools/gyro_sim.py` | 用虚拟 `+DATA` 序列驱动 3D 姿态仪，无需开发板和串口 |
+| `docs/system_test_report.md` | 自动生成的模块化测试报告 |
+| `test-results/` | 最近一次测试的 JSON、测试台和阶段截图 |
+| `requirements.txt` | 运行依赖（pyserial） |
+| `requirements-dev.txt` | 开发与打包依赖（PyInstaller） |
+| `installer/STM32Host.iss` | Inno Setup 7 安装脚本（中文向导、快捷方式、卸载项） |
+| `installer/version_info.txt` | exe 文件版本信息（1.9.0） |
+| `installer/build_installer.bat` | 一键构建 exe 与安装包 |
+| `dist/STM32Host.exe` | 单文件绿色版，免安装直接运行（约 11 MB） |
+| `dist/STM32Host-Setup-1.9.0.exe` | 一键安装包（约 13 MB） |
 | `screenshot.png` | 主界面截图，仓库首页用 |
 | `screenshots/` | 趋势与雷达功能展示图 |
 | `app.ico` | 图标（32/48/64 三档） |
@@ -110,9 +185,9 @@ pyinstaller --noconfirm --clean --onefile --windowed --icon app.ico ^
 
 | 项 | 要求 |
 |---|---|
-| 系统 | Windows 7 及以上 |
-| Python | 3.8+，且安装时勾选了 `tcl/tk and IDLE` |
-| 依赖 | pyserial（启动器会自动安装） |
+| 系统 | Windows 10 / 11 64 位（安装包与 exe 均为 x64） |
+| Python | 仅源码运行需要；Python 3.9+ 64 位，且安装时勾选 `tcl/tk and IDLE` |
+| 依赖 | pyserial（安装包已内置；源码模式由启动器自动安装） |
 | 显示 | 1080p 及以上；支持 100% / 125% / 150% 系统缩放 |
 | 硬件 | 蓝牙模块已与电脑配对，或 USB-TTL 直连开发板 |
 
@@ -132,7 +207,7 @@ pyinstaller --noconfirm --clean --onefile --windowed --icon app.ico ^
 |---|---|
 | 顶部 | 产品标题、连接状态灯、串口下拉、刷新、**波特率下拉**、同步设备速率、连接 |
 | 左栏顶部 | **电脑状态圆环**：CPU / GPU / RAM / NET / FPS，程序一打开就开始刷新，与串口是否连接无关 |
-| 左栏 | 光照、温度、湿度、片内温度、供电电压、三轴加速度、**温度曲线 + 陀螺仪**（并排对齐）、**雷达视图**（在曲线下方，滚轮下滚查看） |
+| 左栏 | 光照、温度、湿度、片内温度、供电电压、三轴加速度、**温度曲线 + 3D 姿态仪**（并排对齐）、**雷达视图**（在曲线下方，滚轮下滚查看） |
 | 右栏 | 舵机角度滑条、舵机锁定、周期遥测开关、**雷达模式开关**、**发送电脑数据开关**、快捷命令按钮 |
 | 发送栏 | 命令输入框（回车即发）、发送命令、清空日志 |
 | 选项栏 | **追加 CRLF**、**HEX 发送**、时间戳（默认开启）、定时发送 + 间隔、命令历史提示 |
@@ -140,18 +215,61 @@ pyinstaller --noconfirm --clean --onefile --windowed --icon app.ico ^
 
 界面使用统一深色视觉规范，连接状态、按钮悬停、等待应答、操作成功/失败都有对应反馈。窗口会根据屏幕工作区和系统 DPI 自动选择 0.9–1.5 倍 UI 缩放，2K 与 1080p 下不会出现整体位图拉伸。
 
-### 陀螺仪面板
+### 3D 姿态仪
 
-位于温度曲线右侧，由从机返回的 `gx` / `gy` / `gz`（角速度）和 `roll` / `pitch`（卡尔曼姿态角）驱动：
+位于温度曲线右侧，采用与主界面一致的深色内嵌仪表：**低饱和蓝灰 3D 立方体、柔和红 X / 绿 Y / 蓝 Z 轴箭头**。立方体随 `roll` / `pitch` 做三维旋转，底部同步显示姿态角和 `gx` / `gy` / `gz` 角速度。
 
-- **左侧姿态气泡**：圆盘 + 绿点，横轴为 roll、纵轴为 pitch，±45° 映射到圆盘边缘；
-  底部显示 `R-11.4 P+34.2` 的具体数值。
-- **右侧三轴角速度条**：`Gx` / `Gy` / `Gz` 三条，量程 ±250 °/s，中间竖线为零点，
-  向右为正、向左为负；数值右对齐显示。
-- **颜色**：|ω| < 20 °/s 绿色（静止）、< 150 橙色（正常转动）、更大为红色（快速甩动）。
+- **姿态**：`roll` 归一化到 `-180°~+180°`，`pitch` 限制在 `-90°~+90°`；
+- **颜色**：三轴使用降饱和的红 X、绿 Y、蓝 Z，立方体使用深蓝灰分层；与深色界面统一，避免高亮刺眼；
+- **数值**：HUD 使用与动画相同的插值角度，避免数字提前跳变、立方体滞后；
+- **自适应**：立方体、箭头和 HUD 均按 Canvas 尺寸与 DPI 缩放。
 
-> 数据来源：`$D` 遥测帧（需开启「周期遥测」）或 `GET` 命令。
-> 面板会随窗口缩放自动调整比例，高 DPI 下也不会裁切。
+#### 数据接收与刷新机制
+
+1. 串口读线程 `readline()` 收到一行；
+2. 通过 `rx_queue` 交给 UI 主线程，由 50ms 一次的 `_poll()` 取出；
+3. `+DATA,key=value,...` 或 11 字段 `$D` 经 `_handle_line()` 解析；
+4. 完整且有限的 `roll/pitch` 更新动画目标，`gx/gy/gz` 更新 HUD；
+5. 已有的 33ms `_animate()` 定时器以 30fps 对角度做时间相关缓动；
+6. 到达目标后停止重绘，静止时不持续消耗 Canvas 性能。
+
+`+DATA` 和 `$D` 共用同一套目标值更新逻辑。`GET` 返回的完整 `+DATA` 会立即触发，周期遥测 `$D` 按固件设置的周期触发。
+
+#### 异常、暂停和断连
+
+| 状态 | 判断 | 显示 |
+|---|---|---|
+| `LIVE` | 2 秒内收到有效姿态帧 | 绿色状态点，立方体正常动画 |
+| `DATA ERR` | NaN/Inf、非法数值，或姿态字段不完整 | 红色状态，拒绝本帧并保留上一姿态 1.2 秒 |
+| `HOLD` | 超过 2 秒没有新的姿态帧 | 橙色状态，保留最后姿态并显示“数据暂停” |
+| `OFFLINE` | 串口断开/尚未连接 | 灰色半透明视觉，保留最后姿态并提示链路断开 |
+| `WAIT` | 刚连接但尚未收到姿态 | 灰色立方体，等待第一帧 |
+
+角度不会因单帧异常归零；断连也不会把界面重置到中位，便于现场判断最后姿态。
+
+#### 模拟器与测试数据
+
+```bat
+python tools/gyro_sim.py
+```
+
+模拟器每 700ms 注入一帧完整 `+DATA`，经过真实解析和 30fps 动画链路，不使用串口。测试序列：
+
+```text
++DATA,light=72,temp=24.86,humi=58,chip=31.2,vdd=3284,ax=15,ay=-8,az=997,servo=96,lock=0,gx=0,gy=0,gz=0,roll=0.0,pitch=0.0
++DATA,light=72,temp=24.86,humi=58,chip=31.2,vdd=3284,ax=15,ay=-8,az=997,servo=96,lock=0,gx=0,gy=0,gz=15,roll=5.0,pitch=0.0
++DATA,light=72,temp=24.86,humi=58,chip=31.2,vdd=3284,ax=15,ay=-8,az=997,servo=96,lock=0,gx=0,gy=0,gz=45,roll=30.0,pitch=-8.0
++DATA,light=72,temp=24.86,humi=58,chip=31.2,vdd=3284,ax=15,ay=-8,az=997,servo=96,lock=0,gx=35,gy=-22,gz=-62,roll=-32.0,pitch=18.0
++$D,72,2486,58,15,-8,997,0,0,0,-120,300
+```
+
+自动化回归：
+
+```bat
+python selftest.py
+```
+
+第 `[8]` 组覆盖 `+DATA` 触发、首帧直接对齐、33ms 可见响应、约 0.5 秒收敛、±180° 最短路径、NaN 拒收、角度钳位、HOLD 和 OFFLINE，共 13 项。
 
 ### 雷达视图
 
@@ -165,7 +283,7 @@ pyinstaller --noconfirm --clean --onefile --windowed --icon app.ico ^
 - **量程** 固定 200cm，超出量程的点压在边缘。
 
 > 左栏内容比窗口高，用**鼠标滚轮**上下滚动查看（指针要在左栏内，不会和日志框抢事件），
-> 也可以拖右侧滚动条。温度曲线和陀螺仪给了同样的高度，两者顶边严格对齐。
+> 也可以拖右侧滚动条。温度曲线和 3D 姿态仪给了同样的高度，两者顶边严格对齐。
 
 > 距离字段目前固定为 `-1`（超声波模块尚未接入），所以只会看到扫描线转动、
 > `ECHO 0`。接上传感器后固件侧只需替换 `bt.c` 的 `radar_measure_cm()`，
@@ -334,7 +452,10 @@ PC,cpu=21,mem=63,gpu=6,ct=-1,gt=-1,cf=4007,gc=-1,ru=101,rt=160,dn=7,up=12,fps=75
 
 | 版本 | 内容 |
 |---|---|
-| v1.6 | 重构界面视觉与信息层级，统一深色配色、字体、间距、圆角卡片和按钮状态；增加**Per-Monitor V2 DPI 感知**及 1080p / 2K 自适应缩放；重绘 Canvas 仪表、图表、陀螺仪、雷达和 DPI 复选框；新增虚拟数据截图工具与三张全功能展示图 |
+| v1.9.0 | 新增 **Inno Setup 7 一键安装包**（中文向导、开始菜单/桌面快捷方式、标准卸载项、按用户安装）；exe 写入 1.9.0 文件版本信息；补充 `requirements.txt` / `requirements-dev.txt` 与可复现构建脚本；清理 `__pycache__`、旧构建临时目录和误建空文件；README 增加安装、卸载、构建与 SmartScreen 说明 |
+| v1.8 | 新增前台系统测试台：55 项 E2E 覆盖通信、控制、传感器、界面、异常恢复；陀螺仪、温度曲线、雷达长时验证均超过 5 秒；自动生成模块报告、JSON 和阶段截图；修复温度曲线平滑线及标签 1px 越界 |
+| v1.7 | 重做 **3D 姿态仪**：深色低饱和仪表、蓝灰立方体、柔和红 X / 绿 Y / 蓝 Z 轴；姿态由 `+DATA` / `$D` 驱动，30fps 时间缓动；新增 `LIVE / WAIT / HOLD / DATA ERR / OFFLINE` 状态、NaN 拒收、角度钳位和断连保持；新增 `tools/gyro_sim.py` 模拟器与 13 项姿态回归测试，自检 79 项全部通过 |
+| v1.6 | 重构界面视觉与信息层级，统一深色配色、字体、间距、圆角卡片和按钮状态；增加**Per-Monitor V2 DPI 感知**及 1080p / 2K 自适应缩放；重绘 Canvas 仪表、图表、陀螺仪、雷达和 DPI 复选框；新增虚拟数据截图工具与四张全功能展示图 |
 | v1.5 | 增加**电脑状态圆环**（CPU / GPU / RAM / NET / FPS，打开即刷新）与「发送电脑数据 1s」开关；新增 `sysinfo.py`（纯 ctypes 采集，含 PDH GPU 计数器、DWM 帧率、HWiNFO 温度）；协议增加 `PC,...` 帧；`selftest.py` 增加 9 项 PC 帧校验 |
 | v1.4 | 增加**雷达视图**（半圆极坐标 + 30fps 补间扫描 + 渐隐拖尾 + 回波点）与「雷达模式」开关；协议增加 `RADAR,<0/1>[,<dps>]` 与 `$R` 帧；时间戳默认开启；修复 `clam` 主题复选框显示成"叉"的问题；左栏改为滚轮滚动，雷达图移到温度曲线下方、曲线与陀螺仪顶边对齐、移除重复的舵机读数；`selftest.py` 覆盖雷达收发 |
 | v1.3 | 增加 `selftest.py` 离线自检；`+DATA` 的 `lock` / `servo` 字段回写到复选框与滑条（仅 `+DATA`，周期遥测不回写，避免覆盖用户操作） |

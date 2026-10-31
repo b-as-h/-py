@@ -1,0 +1,401 @@
+{
+  "generated_at": "2026-10-31T12:23:35.043333+08:00",
+  "result": "PASS",
+  "passed": 55,
+  "failed": 0,
+  "unit_regression": {
+    "passed": true,
+    "summary": "79 通过 / 0 失败",
+    "output": "[1] 发送侧：命令拼装（与 bt.c 的 bt_exec 对齐）\n  OK   发出 PING\n  OK   发出 GET\n  OK   发出 SERVO,90\n  OK   发出 LOCK,1\n  OK   发出 STREAM,1,500\n  OK   发出 BAUD,115200\n  OK   发出 SYS\n  OK   发出 VER\n  OK   发出 RESET\n  OK   关闭自动回车后不加 CRLF\n[2] 接收侧：+DATA 全字段\n  OK   light\n  OK   temp\n  OK   humi\n  OK   chip\n  OK   vdd\n  OK   ax(mg)\n  OK   gx\n  OK   roll\n  OK   pitch\n  OK   lock 同步到复选框\n  OK   servo 同步到滑条\n  OK   左栏已移除舵机读数\n  OK   左栏可滚动\n[3] 接收侧：$D 11 字段遥测帧\n  OK   light\n  OK   temp=25.34\n  OK   gz\n  OK   roll=-12.0\n  OK   pitch=30.0\n  OK   陀螺仪画布不越界\n[4] 兼容性：旧固件 6 字段 $D\n  OK   旧帧能正常解析\n  OK   旧帧不影响陀螺仪字段\n[5] 健壮性：异常帧不应抛异常\n  OK   处理 '$D,'\n  OK   处理 '$D,a,b,c,d,e,f'\n  OK   处理 '+DATA,garbage'\n  OK   处理 '+DATA,light=abc'\n  OK   处理 '-ERR,LOCKED'\n  OK   处理 '-ERR,BAUD'\n  OK   处理 '+OK'\n  OK   处理 '+OK,BAUD'\n  OK   处理 '+PONG'\n  OK   处理 '+SYS,rst=POR,up=1,baud=9600'\n  OK   处理 '+VER,BASH-STM32,1.4.0'\n  OK   处理 '乱码\\x00\\x01'\n[6] 波特率切换流程\n  OK   在旧链路上发 BAUD\n  OK   挂起等待确认\n  OK   确认后清除挂起\n[7] 雷达模式\n  OK   开启时发 RADAR,1,60\n  OK   雷达画布存在\n  OK   角度写入\n  OK   距离落点\n  OK   无回波不落点\n  OK   无回波仍更新角度\n  OK   角度越界被钳到 180\n  OK   雷达画布不越界\n  OK   关闭时发 RADAR,0\n  OK   +OK,RADAR=1 回写复选框\n  OK   +OK,RADAR=0 清除复选框\n  OK   PC 帧以 PC, 开头\n  OK   PC 帧字段齐全\n  OK   PC 帧全是整数（MCU 端不用解析浮点）\n  OK   占用率在 0-100\n  OK   内存总量为正\n  OK   PC 帧长度适合 9600 波特率\n  OK   推送期间吞掉 -ERR,UNKNOWN\n  OK   固件不支持只提示一次\n  OK   未推送时 -ERR 照常记录\n[8] 3D 姿态仪：数据触发、缓动、异常与断连\n  OK   +DATA 更新姿态目标\n  OK   首帧直接对齐显示姿态\n  OK   在线状态为 LIVE\n  OK   单帧 33ms 即产生可感知响应\n  OK   约 0.5 秒平滑收敛到目标\n  OK   跨越 ±180° 时走最短方向\n  OK   NaN 姿态不污染目标\n  OK   非法帧显示 DATA ERR\n  OK   +DATA 中的 NaN 不抛异常\n  OK   +DATA 中的 NaN 保留上一目标\n  OK   横滚归一化且俯仰钳位\n  OK   超过 2 秒无帧显示 HOLD\n  OK   断连显示 OFFLINE\n\n结果: 79 通过 / 0 失败\n"
+  },
+  "long_stages": {
+    "陀螺仪": {
+      "duration": 6.4,
+      "frames": 53,
+      "states": [
+        "DATA ERR",
+        "HOLD",
+        "LIVE",
+        "OFFLINE"
+      ],
+      "shot": "test-results/system_gyro.png"
+    },
+    "温度曲线": {
+      "duration": 5.61,
+      "frames": 13,
+      "points": 13,
+      "range_c": [
+        10.39,
+        37.96
+      ],
+      "shot": "test-results/system_temperature.png"
+    },
+    "超声波雷达": {
+      "duration": 5.62,
+      "frames": 105,
+      "angles": 96,
+      "points": 91,
+      "shot": "test-results/system_radar.png"
+    }
+  },
+  "hud_evidence": "test-results/system_test_hud.png",
+  "stages": [
+    {
+      "name": "基础通信与控件",
+      "module": "基础通信",
+      "duration": 0.906
+    },
+    {
+      "name": "陀螺仪 · 5 秒动态与状态迁移",
+      "module": "陀螺仪",
+      "duration": 6.401
+    },
+    {
+      "name": "温度曲线 · 5 秒持续采样",
+      "module": "温度曲线",
+      "duration": 5.608
+    },
+    {
+      "name": "超声波雷达 · 5 秒扫描",
+      "module": "超声波雷达",
+      "duration": 5.619
+    },
+    {
+      "name": "断连、恢复与最终汇总",
+      "module": "异常恢复",
+      "duration": 1.222
+    }
+  ],
+  "cases": [
+    {
+      "module": "协议单元回归",
+      "case": "selftest.py 完整回归",
+      "passed": true,
+      "detail": "79 通过 / 0 失败"
+    },
+    {
+      "module": "界面与 DPI",
+      "case": "主窗口和三栏完成构建",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "界面与 DPI",
+      "case": "UI 缩放已计算",
+      "passed": true,
+      "detail": "scale=1.250"
+    },
+    {
+      "module": "电脑状态",
+      "case": "性能圆环绘制",
+      "passed": true,
+      "detail": "25"
+    },
+    {
+      "module": "串口与协议",
+      "case": "PONG 更新在线状态",
+      "passed": true,
+      "detail": "在线 @ 115200"
+    },
+    {
+      "module": "串口与协议",
+      "case": "PING 命令编码",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "串口与协议",
+      "case": "关闭 CRLF 后原样发送",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "串口与协议",
+      "case": "HEX 合法输入",
+      "passed": true,
+      "detail": "b'\\xaaU\\x01'"
+    },
+    {
+      "module": "串口与协议",
+      "case": "HEX 非法输入返回 None",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "串口与协议",
+      "case": "HEX 界面发送实际字节",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "串口与协议",
+      "case": "非法 HEX 不发送",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "串口与协议",
+      "case": "命令历史记录与回填",
+      "passed": true,
+      "detail": "['AA 55 01', 'ZZ', 'PING']"
+    },
+    {
+      "module": "串口与协议",
+      "case": "↑ 历史命令回填",
+      "passed": true,
+      "detail": "PING"
+    },
+    {
+      "module": "串口与协议",
+      "case": "同步波特率走旧链路发送",
+      "passed": true,
+      "detail": "19200"
+    },
+    {
+      "module": "电脑状态",
+      "case": "不支持 PC 时只提示一次",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "日志与反馈",
+      "case": "版本与错误应答进入日志",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "日志与反馈",
+      "case": "时间戳前缀与清空功能",
+      "passed": true,
+      "detail": "12:23:14 timestamp check"
+    },
+    {
+      "module": "异常恢复",
+      "case": "未连接时发送被拒绝",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "舵机与控制",
+      "case": "滑条发送 SERVO,125",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "舵机与控制",
+      "case": "锁定发送 LOCK,1",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "舵机与控制",
+      "case": "遥测发送 STREAM,1,500",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "传感器数据",
+      "case": "+DATA 全字段解析",
+      "passed": true,
+      "detail": "{'light': 82, 'temp': 25.34, 'servo': 125, 'lock': 0}"
+    },
+    {
+      "module": "传感器数据",
+      "case": "传感器标签同步",
+      "passed": true,
+      "detail": "82"
+    },
+    {
+      "module": "传感器数据",
+      "case": "边界字段接收",
+      "passed": true,
+      "detail": "(180, 90.0)"
+    },
+    {
+      "module": "异常数据",
+      "case": "NaN 帧不抛异常且不污染姿态",
+      "passed": true,
+      "detail": "-180.0"
+    },
+    {
+      "module": "传感器数据",
+      "case": "旧版 6 字段 $D 兼容",
+      "passed": true,
+      "detail": "21.5"
+    },
+    {
+      "module": "传感器数据",
+      "case": "11 字段 $D 遥测解析",
+      "passed": true,
+      "detail": "(28.56, -4.5)"
+    },
+    {
+      "module": "温度曲线",
+      "case": "历史缓存上限 120",
+      "passed": true,
+      "detail": "120"
+    },
+    {
+      "module": "电脑状态",
+      "case": "PC 帧全整数且字段完整",
+      "passed": true,
+      "detail": "86"
+    },
+    {
+      "module": "日志与反馈",
+      "case": "版本与错误应答进入日志",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "基础通信",
+      "case": "基础阶段时长有效",
+      "passed": true,
+      "detail": "0.91s"
+    },
+    {
+      "module": "陀螺仪",
+      "case": "持续展示不少于 5 秒",
+      "passed": true,
+      "detail": "6.40s"
+    },
+    {
+      "module": "陀螺仪",
+      "case": "20Hz 连续采样并驱动姿态",
+      "passed": true,
+      "detail": "53"
+    },
+    {
+      "module": "陀螺仪",
+      "case": "姿态画面持续变化",
+      "passed": true,
+      "detail": "47"
+    },
+    {
+      "module": "陀螺仪",
+      "case": "画布内容有效无溢出",
+      "passed": true,
+      "detail": "29"
+    },
+    {
+      "module": "陀螺仪",
+      "case": "状态覆盖 LIVE/HOLD/DATA ERR/OFFLINE",
+      "passed": true,
+      "detail": "['DATA ERR', 'HOLD', 'LIVE', 'OFFLINE']"
+    },
+    {
+      "module": "温度曲线",
+      "case": "持续展示不少于 5 秒",
+      "passed": true,
+      "detail": "5.61s"
+    },
+    {
+      "module": "温度曲线",
+      "case": "2.5Hz 持续采样更新",
+      "passed": true,
+      "detail": "13"
+    },
+    {
+      "module": "温度曲线",
+      "case": "温度历史逐帧增长",
+      "passed": true,
+      "detail": "13"
+    },
+    {
+      "module": "温度曲线",
+      "case": "曲线已绘制",
+      "passed": true,
+      "detail": "3"
+    },
+    {
+      "module": "温度曲线",
+      "case": "坏帧不追加数据点",
+      "passed": true,
+      "detail": "(13, 13)"
+    },
+    {
+      "module": "温度曲线",
+      "case": "温度范围符合注入数据",
+      "passed": true,
+      "detail": "(10.39, 37.96)"
+    },
+    {
+      "module": "温度曲线",
+      "case": "画布内容无溢出",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "超声波雷达",
+      "case": "持续展示不少于 5 秒",
+      "passed": true,
+      "detail": "5.62s"
+    },
+    {
+      "module": "超声波雷达",
+      "case": "20Hz 帧持续更新",
+      "passed": true,
+      "detail": "105"
+    },
+    {
+      "module": "超声波雷达",
+      "case": "扫描角度发生变化",
+      "passed": true,
+      "detail": "96"
+    },
+    {
+      "module": "超声波雷达",
+      "case": "有效回波点已绘制",
+      "passed": true,
+      "detail": "91"
+    },
+    {
+      "module": "超声波雷达",
+      "case": "无回波值 -1 未写入点",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "超声波雷达",
+      "case": "超量程点被限制显示",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "超声波雷达",
+      "case": "越界角度被钳位",
+      "passed": true,
+      "detail": "180"
+    },
+    {
+      "module": "超声波雷达",
+      "case": "雷达画布无溢出",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "超声波雷达",
+      "case": "雷达关闭命令正确",
+      "passed": true,
+      "detail": "b'RADAR,0\\r\\n'"
+    },
+    {
+      "module": "异常恢复",
+      "case": "断连状态 OFFLINE",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "module": "异常恢复",
+      "case": "恢复链路后回到 LIVE",
+      "passed": true,
+      "detail": "('LIVE', '#4fc3a1', '')"
+    },
+    {
+      "module": "异常恢复",
+      "case": "恢复后数据继续更新",
+      "passed": true,
+      "detail": "(6.5, -3.0)"
+    }
+  ]
+}

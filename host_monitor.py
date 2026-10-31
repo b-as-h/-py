@@ -46,6 +46,9 @@ FLOAT_KEYS = ("temp", "chip", "roll", "pitch")
 RADAR_MAX_CM = 200          # 雷达视图量程，超过的点压在边缘
 RADAR_DPS = 60              # 雷达扫描角速度，与固件默认一致
 RADAR_TRAIL = 14            # 扫描线拖尾的条数
+GYRO_KEYS = ("gx", "gy", "gz", "roll", "pitch")
+GYRO_STALE_S = 2.0          # 超过 2 秒无新姿态帧则标记 HOLD
+GYRO_TAU_S = 0.10           # 30fps 下的姿态缓动时间常数
 
 # 统一的桌面工具视觉规范：低亮度底色、分层面板、单一强调色。
 BG = "#10151b"
@@ -63,6 +66,25 @@ INPUT = "#121a22"
 SHADOW = "#090d11"
 FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
+
+# 3D 姿态仪：深色内嵌表面，低饱和蓝灰立方体与柔和三轴。
+GYRO_BG = PANEL_ALT
+GYRO_INK = "#d9e5ec"
+GYRO_SUB = "#8294a5"
+GYRO_LINE = BORDER
+GYRO_CUBE_TOP = "#3d738b"
+GYRO_CUBE_FRONT = "#2d6076"
+GYRO_CUBE_RIGHT = "#244f63"
+GYRO_CUBE_LEFT = "#29596f"
+GYRO_CUBE_BACK = "#204757"
+GYRO_CUBE_BOTTOM = "#1b3c4b"
+GYRO_CUBE_EDGE = "#183743"
+AXIS_X = "#c96a6e"
+AXIS_Y = "#65a17c"
+AXIS_Z = "#748fc8"
+GYRO_LIVE = ACCENT
+GYRO_HOLD = "#d3a15d"
+GYRO_FAULT = "#cf7477"
 UI_SCALE = 1.0
 
 
@@ -237,6 +259,19 @@ class MonitorApp:
         self.await_pong = 0.0
         self.timer_last = 0.0
         self.got_data = False       # 是否已收到过一帧数据
+        self.gyro_link = False      # 串口链路状态（用于姿态仪断连提示）
+        self.gyro_has_data = False
+        self.gyro_target_roll = 0.0
+        self.gyro_target_pitch = 0.0
+        self.gyro_disp_roll = 0.0
+        self.gyro_disp_pitch = 0.0
+        self.gyro_gx = 0.0
+        self.gyro_gy = 0.0
+        self.gyro_gz = 0.0
+        self.gyro_last_rx = 0.0
+        self.gyro_fault_until = 0.0
+        self.gyro_anim_at = time.monotonic()
+        self.gyro_drawn_state = ""
         self.active_baud = 0        # 当前端口实际使用的波特率
         self.pending_baud = 0       # 等待设备确认的目标波特率
         self.baud_deadline = 0.0
@@ -458,13 +493,13 @@ class MonitorApp:
         chart_head = tk.Frame(left, bg=PANEL)
         self.chart_head = chart_head
         chart_head.pack(fill="x", pady=(_sp(4), _sp(4)))
-        ttk.Label(chart_head, text="趋势与姿态", style="Section.TLabel").pack(side="left")
-        ttk.Label(chart_head, text="温度历史 / 陀螺仪",
+        ttk.Label(chart_head, text="温度与 IMU 姿态", style="Section.TLabel").pack(side="left")
+        ttk.Label(chart_head, text="实时曲线 / 3D 姿态",
                   style="Muted.TLabel").pack(side="right", pady=(_sp(3), 0))
 
         # 两块画布给同一个高度，左右顶边才会严格对齐（之前 Notebook 的标签栏
         # 会把温度曲线整体压下去，和右边的陀螺仪错开二十多像素）
-        chart_h = _sp(180)
+        chart_h = _sp(220)
         charts = ttk.Frame(left)
         charts.pack(fill="x")
 
@@ -474,8 +509,8 @@ class MonitorApp:
 
         gyro_col = ttk.Frame(charts, padding=(_sp(10), 0, 0, 0))
         gyro_col.pack(side="right", fill="y")
-        self.gyro = tk.Canvas(gyro_col, width=_sp(300), height=chart_h,
-                              bg=PANEL_ALT, highlightthickness=0)
+        self.gyro = tk.Canvas(gyro_col, width=_sp(320), height=chart_h,
+                              bg=GYRO_BG, highlightthickness=0)
         self.gyro.pack(fill="both", expand=True)
         self.gyro.bind("<Configure>", lambda e: self._draw_gyro())
 
@@ -716,11 +751,13 @@ class MonitorApp:
             return
         self.active_baud = baud
         self.alive = True
+        self.gyro_link = True
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.reader.start()
         self.connect_btn.configure(text="等待应答")
         self._set_status(f"已连接 {device} @ {baud} · 等待设备", "warn")
         self._log(f"已连接 {device} @ {baud}")
+        self._draw_gyro()
         self.await_pong = time.time()
         self._send("PING")
 
@@ -734,8 +771,10 @@ class MonitorApp:
                 pass
         self.ser = None
         self.active_baud = 0
+        self.gyro_link = False
         self.connect_btn.configure(text="连接设备")
         self._set_status("未连接", "muted")
+        self._draw_gyro()
         if not silent:
             self._log("已断开")
             self._notify("连接已断开", MUTED)
@@ -1097,6 +1136,8 @@ class MonitorApp:
             self._draw_radar()
 
         if line.startswith("+DATA,"):
+            gyro_values = {}
+            gyro_bad = False
             for item in line[6:].split(","):
                 if "=" not in item:
                     continue
@@ -1104,15 +1145,32 @@ class MonitorApp:
                 if key not in self.data:
                     continue
                 try:
-                    self.data[key] = float(val) if key in FLOAT_KEYS else int(float(val))
+                    raw = float(val)
                 except ValueError:
+                    if key in GYRO_KEYS:
+                        gyro_bad = True
                     continue
+                if not math.isfinite(raw):
+                    if key in GYRO_KEYS:
+                        gyro_bad = True
+                    continue
+                self.data[key] = raw if key in FLOAT_KEYS else int(raw)
+                if key in GYRO_KEYS:
+                    gyro_values[key] = raw
             # 只有 +DATA 带 servo / lock，$D 不带，所以同步只在这里做，
             # 否则周期遥测会把用户刚勾选的锁定状态改回去。
             self.lock_var.set(bool(self.data["lock"]))
             self.scale.set(self.data["servo"])
             self.angle_label.configure(text=f"{self.data['servo']}°")
             self._refresh_values()
+            if "roll" in gyro_values and "pitch" in gyro_values:
+                self._set_gyro_target(
+                    gyro_values.get("gx", self.gyro_gx),
+                    gyro_values.get("gy", self.gyro_gy),
+                    gyro_values.get("gz", self.gyro_gz),
+                    gyro_values["roll"], gyro_values["pitch"])
+            elif gyro_bad:
+                self._mark_gyro_fault()
         elif line.startswith("$D,"):
             parts = line[3:].split(",")
             if len(parts) >= 6:
@@ -1133,6 +1191,10 @@ class MonitorApp:
                 except ValueError:
                     return
                 self._refresh_values()
+                if len(parts) >= 11:
+                    self._set_gyro_target(
+                        self.data["gx"], self.data["gy"], self.data["gz"],
+                        self.data["roll"], self.data["pitch"])
                 self._push_history(self.data["temp"])
         elif line.startswith("$R,"):
             parts = line[3:].split(",")
@@ -1166,66 +1228,234 @@ class MonitorApp:
         self.acc_label.configure(
             text=f"ax {d['ax']/1000:.2f}   ay {d['ay']/1000:.2f}   az {d['az']/1000:.2f}")
         self.got_data = True
+
+    @staticmethod
+    def _shortest_angle(current, target):
+        """角度插值走最短方向，避免 -179° → +179° 时绕一整圈。"""
+        return (target - current + 180.0) % 360.0 - 180.0
+
+    @staticmethod
+    def _rotate_xyz(x, y, z, roll, pitch):
+        """先绕 X 轴俯仰，再绕 Y 轴横滚。"""
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cr, sr = math.cos(roll), math.sin(roll)
+        y1 = y * cp - z * sp
+        z1 = y * sp + z * cp
+        return x * cr + z1 * sr, y1, -x * sr + z1 * cr
+
+    @staticmethod
+    def _project_xyz(x, y, z, cx, cy, scale):
+        """等距投影：X 向右、Y 向左前、Z 向上。"""
+        return cx + scale * (1.08 * x - 0.48 * y), cy + scale * (-z + 0.34 * y)
+
+    def _mark_gyro_fault(self):
+        self.gyro_fault_until = time.monotonic() + 1.2
         self._draw_gyro()
 
-    def _draw_gyro(self):
-        """左侧姿态气泡（roll/pitch）+ 右侧三轴角速度条（Gx/Gy/Gz，±250°/s）。
+    def _set_gyro_target(self, gx, gy, gz, roll, pitch):
+        """接收一帧已解析姿态。非有限值不进入动画，保留上一姿态。"""
+        try:
+            gx, gy, gz = float(gx), float(gy), float(gz)
+            roll, pitch = float(roll), float(pitch)
+        except (TypeError, ValueError):
+            self._mark_gyro_fault()
+            return False
+        if not all(math.isfinite(v) for v in (gx, gy, gz, roll, pitch)):
+            self._mark_gyro_fault()
+            return False
 
-        所有坐标按画布实际尺寸按比例计算，窗口缩放或高 DPI 下都不会越界。
-        """
+        self.gyro_gx = max(-2000.0, min(2000.0, gx))
+        self.gyro_gy = max(-2000.0, min(2000.0, gy))
+        self.gyro_gz = max(-2000.0, min(2000.0, gz))
+        self.gyro_target_roll = (roll + 180.0) % 360.0 - 180.0
+        self.gyro_target_pitch = max(-90.0, min(90.0, pitch))
+        self.gyro_last_rx = time.monotonic()
+        self.gyro_fault_until = 0.0
+
+        first = not self.gyro_has_data
+        self.gyro_has_data = True
+        self.got_data = True
+        if first:
+            # 第一帧直接对齐，避免从上电初始 0° 大幅甩入。
+            self.gyro_disp_roll = self.gyro_target_roll
+            self.gyro_disp_pitch = self.gyro_target_pitch
+        self._draw_gyro()
+        return True
+
+    def _gyro_status(self, now=None):
+        now = time.monotonic() if now is None else now
+        if not self.gyro_link:
+            return "OFFLINE", GYRO_SUB, "链路已断开 · 保留最后姿态"
+        if now < self.gyro_fault_until:
+            return "DATA ERR", GYRO_FAULT, "数据异常 · 保持上一姿态"
+        if not self.gyro_has_data:
+            return "WAIT", GYRO_SUB, "等待 IMU 数据"
+        if now - self.gyro_last_rx > GYRO_STALE_S:
+            return "HOLD", GYRO_HOLD, "数据暂停 · 等待新帧"
+        return "LIVE", GYRO_LIVE, ""
+
+    def _step_gyro(self, now=None):
+        """30fps 姿态缓动；静止时不重绘，避免持续占用 Canvas。"""
+        now = time.monotonic() if now is None else now
+        state = self._gyro_status(now)[0]
+        state_changed = state != self.gyro_drawn_state
+
+        if not self.gyro_link or not self.gyro_has_data:
+            self.gyro_anim_at = now
+            if state_changed:
+                self._draw_gyro(now)
+            return False
+
+        dt = max(0.0, min(0.10, now - self.gyro_anim_at))
+        self.gyro_anim_at = now
+        if dt <= 0:
+            if state_changed:
+                self._draw_gyro(now)
+            return False
+
+        alpha = 1.0 - math.exp(-dt / GYRO_TAU_S)
+        dr = self._shortest_angle(self.gyro_disp_roll, self.gyro_target_roll)
+        dp = self.gyro_target_pitch - self.gyro_disp_pitch
+        if abs(dr) < 0.03:
+            dr = 0.0
+        if abs(dp) < 0.03:
+            dp = 0.0
+        moved = abs(dr) > 0.001 or abs(dp) > 0.001
+        if moved:
+            self.gyro_disp_roll += dr * alpha
+            self.gyro_disp_pitch += dp * alpha
+        if state_changed or moved:
+            self._draw_gyro(now)
+        return moved
+
+    def _draw_gyro(self, now=None):
+        """白底 3D 姿态仪：蓝色立方体 + 红/绿/蓝三轴。"""
+        now = time.monotonic() if now is None else now
         c = self.gyro
         c.delete("all")
-        w = max(c.winfo_width(), _sp(200))
-        h = max(c.winfo_height(), _sp(110))
+        w = max(c.winfo_width(), _sp(220))
+        h = max(c.winfo_height(), _sp(150))
+        state, state_color, state_msg = self._gyro_status(now)
+        self.gyro_drawn_state = state
+        has_data = self.gyro_has_data
 
-        if not self.got_data:
-            c.create_text(w / 2, h / 2, text="等待陀螺仪数据…", fill=MUTED)
-            return
+        c.create_rectangle(1, 1, w - 1, h - 1, fill=GYRO_BG, outline=GYRO_LINE)
+        c.create_text(_sp(12), _sp(12), text="3D ATTITUDE", anchor="nw",
+                      fill=GYRO_SUB, font=(FONT_MONO, 8))
+        dot = max(3, _sp(4))
+        dx, dy = w - _sp(86), _sp(17)
+        c.create_oval(dx - dot, dy - dot, dx + dot, dy + dot,
+                      fill=state_color, outline="")
+        c.create_text(w - _sp(12), _sp(12), text=state, anchor="ne",
+                      fill=state_color, font=(FONT_MONO, 9, "bold"))
 
-        d = self.data
-        mid_y = h * 0.44
+        hud_top = h - _sp(52)
+        c.create_line(_sp(12), hud_top, w - _sp(12), hud_top, fill=GYRO_LINE)
+        draw_bottom = hud_top - _sp(22)
+        if state_msg:
+            c.create_text(w / 2, draw_bottom + _sp(4), text=state_msg,
+                          fill=state_color, font=(FONT_UI, 8))
+        cx = w / 2
+        cy = (_sp(34) + draw_bottom) / 2
+        scale = max(_sp(28), min(w * 0.21,
+                                  (draw_bottom - _sp(34)) / 3.5))
+        fade = (not has_data) or (not self.gyro_link)
 
-        # ---- 姿态气泡 ----
-        r = min(h * 0.30, w * 0.15)
-        cx, cy = r + _sp(10), mid_y
-        c.create_oval(cx - r, cy - r, cx + r, cy + r, outline="#4a4a52",
-                      width=max(1, _sp(2)))
-        c.create_oval(cx - r * 0.55, cy - r * 0.55, cx + r * 0.55, cy + r * 0.55,
-                      outline="#33333a")
-        c.create_line(cx - r, cy, cx + r, cy, fill=BORDER)
-        c.create_line(cx, cy - r, cx, cy + r, fill=BORDER)
+        def shade(color):
+            return self._blend(color, GYRO_BG, 0.74) if fade else color
 
-        roll, pitch = d["roll"], d["pitch"]
-        bx = cx + max(-1.0, min(1.0, roll / 45.0)) * r * 0.62
-        by = cy - max(-1.0, min(1.0, pitch / 45.0)) * r * 0.62
-        dot = _sp(7)
-        c.create_oval(bx - dot, by - dot, bx + dot, by + dot,
-                      fill=ACCENT, outline="")
-        c.create_text(_sp(4), h - _sp(10), text=f"R{roll:+.1f}  P{pitch:+.1f}",
-                      fill=MUTED, anchor="w", font=("Consolas", 9))
+        roll = math.radians(self.gyro_disp_roll)
+        pitch = math.radians(self.gyro_disp_pitch)
+        # 投影射线与 _project_xyz 的剪切变换严格对应；按射线深度从后往前
+        # 绘制六个面，避免错误背面裁剪造成缺口或尖角。
+        ray = (1.08, 2.25, 0.765)
 
-        # ---- 三轴角速度条 ----
-        x0 = w * 0.44
-        x1 = w * 0.80
-        mid = (x0 + x1) / 2
-        span = x1 - x0
-        spacing = max(min(float(_sp(66)), (h - _sp(80)) / 2.0), float(_sp(22)))
+        def transform(x, y, z):
+            return self._rotate_xyz(x, y, z, roll, pitch)
 
-        for i, (name, val) in enumerate((("Gx", d["gx"]), ("Gy", d["gy"]), ("Gz", d["gz"]))):
-            y = mid_y + (i - 1) * spacing
-            c.create_text(x0 - _sp(7), y, text=name, fill=MUTED, anchor="e",
-                          font=("Consolas", 9))
-            c.create_line(x0, y, x1, y, fill=BORDER)
-            tick = _sp(7)
-            c.create_line(mid, y - tick, mid, y + tick, fill=MUTED)
-            frac = max(-1.0, min(1.0, val / 250.0))
-            ex = mid + frac * span / 2
-            mag = abs(val)
-            color = ACCENT if mag < 20 else (WARN if mag < 150 else DANGER)
-            if abs(ex - mid) >= 1:
-                c.create_line(mid, y, ex, y, fill=color, width=max(2, _sp(6)))
-            c.create_text(w - _sp(5), y, text=f"{val:+d}", fill=FG, anchor="e",
-                          font=("Consolas", 9))
+        def project(x, y, z):
+            tx, ty, tz = transform(x, y, z)
+            return self._project_xyz(tx, ty, tz, cx, cy, scale), (tx, ty, tz)
+
+        # 负向轴尾先画，立方体后画；正向箭头最后叠加，保证三轴从中心清晰穿出。
+        origin, _ = project(0.0, 0.0, 0.0)
+        for color, neg in ((AXIS_X, (-1.55, 0.0, 0.0)),
+                           (AXIS_Z, (0.0, 0.0, -1.62))):
+            p1, _ = project(*neg)
+            c.create_line(p1[0], p1[1], origin[0], origin[1],
+                          fill=shade(color), width=max(1, _sp(2)),
+                          capstyle="round")
+
+        verts = (
+            (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+            (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1),
+        )
+        faces = (
+            ((0, 1, 2, 3), GYRO_CUBE_BOTTOM),
+            ((4, 5, 6, 7), GYRO_CUBE_TOP),
+            ((0, 1, 5, 4), GYRO_CUBE_FRONT),
+            ((2, 3, 7, 6), GYRO_CUBE_BACK),
+            ((1, 2, 6, 5), GYRO_CUBE_RIGHT),
+            ((3, 0, 4, 7), GYRO_CUBE_LEFT),
+        )
+        visible = []
+        for idxs, color in faces:
+            points = []
+            depth = 0.0
+            for idx in idxs:
+                point, world = project(*verts[idx])
+                points.extend(point)
+                depth += sum(world[i] * ray[i] for i in range(3)) / len(idxs)
+            visible.append((depth, points, color))
+        visible.sort(key=lambda item: item[0], reverse=True)
+        for _, points, color in visible:
+            c.create_polygon(points, fill=shade(color), outline=shade(GYRO_CUBE_EDGE),
+                             width=1)
+
+        axes = (
+            (AXIS_X, (2.25, 0.0, 0.0)),
+            (AXIS_Y, (0.0, 2.25, 0.0)),
+            (AXIS_Z, (0.0, 0.0, 2.12)),
+        )
+        arrow = (max(8, _sp(11)), max(10, _sp(15)), max(3, _sp(5)))
+        for color, pos in axes:
+            p2, _ = project(*pos)
+            c.create_line(origin[0], origin[1], p2[0], p2[1],
+                          fill=shade(color), width=max(1, _sp(2)),
+                          arrow="last", arrowshape=arrow)
+
+        # 底部 HUD：姿态与三轴角速度使用同一组轴色。
+        val_color = GYRO_INK if state in ("LIVE", "HOLD") else GYRO_SUB
+        y1 = hud_top + _sp(12)
+        y2 = hud_top + _sp(34)
+        roll_txt = f"{self.gyro_disp_roll:+.1f}°" if has_data else "--"
+        pitch_txt = f"{self.gyro_disp_pitch:+.1f}°" if has_data else "--"
+        c.create_text(_sp(12), y1, text="ROLL", anchor="w",
+                      fill=GYRO_SUB, font=(FONT_UI, 8))
+        c.create_text(_sp(52), y1, text=roll_txt, anchor="w",
+                      fill=GYRO_INK, font=(FONT_MONO, 10, "bold"))
+        c.create_text(w / 2 + _sp(8), y1, text="PITCH", anchor="w",
+                      fill=GYRO_SUB, font=(FONT_UI, 8))
+        c.create_text(w / 2 + _sp(56), y1, text=pitch_txt, anchor="w",
+                      fill=GYRO_INK, font=(FONT_MONO, 10, "bold"))
+
+        x = _sp(12)
+        c.create_text(x, y2, text="ω", anchor="w", fill=GYRO_SUB,
+                      font=(FONT_MONO, 9))
+        for label, color, value in (
+                ("X", AXIS_X, self.gyro_gx),
+                ("Y", AXIS_Y, self.gyro_gy),
+                ("Z", AXIS_Z, self.gyro_gz)):
+            x += _sp(21)
+            c.create_text(x, y2, text=label, anchor="w", fill=color,
+                          font=(FONT_MONO, 9, "bold"))
+            x += _sp(13)
+            text = f"{value:+.0f}" if has_data else "--"
+            c.create_text(x, y2, text=text, anchor="w", fill=val_color,
+                          font=(FONT_MONO, 9))
+            x += _sp(46)
+        c.create_text(w - _sp(12), y2, text="°/s", anchor="e",
+                      fill=GYRO_SUB, font=(FONT_MONO, 8))
 
     @staticmethod
     def _blend(c_from, c_to, t):
@@ -1236,17 +1466,15 @@ class MonitorApp:
         return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
     def _animate(self):
-        """雷达扫描的本地补间。
-
-        固件按 20Hz 回 $R，如果只在收到帧时才重画，扫描线是"跳"的。
-        这里以 30fps 把显示角度逐步追向最新角度，视觉上才是连续转动。
-        """
+        """30fps 本地补间：雷达扫描 + 3D 姿态同步刷新。"""
+        now = time.monotonic()
         if self.radar_on:
             diff = self.radar_angle - self.radar_disp
             if abs(diff) > 0.15:
                 self.radar_prev = self.radar_disp
                 self.radar_disp += diff * 0.45
                 self._draw_radar()
+        self._step_gyro(now)
         self.root.after(33, self._animate)
 
     def _draw_radar(self):
@@ -1342,15 +1570,15 @@ class MonitorApp:
         hi = max(self.history)
         if hi - lo < 1.0:
             hi = lo + 1.0
-        step = w / (HISTORY - 1)
+        step = max(1, w - _sp(16)) / (HISTORY - 1)
         pts = []
         for i, v in enumerate(self.history):
-            x = i * step
-            y = h - _sp(12) - (v - lo) / (hi - lo) * (h - _sp(28))
+            x = _sp(8) + i * step
+            y = h - _sp(14) - (v - lo) / (hi - lo) * (h - _sp(34))
             pts.extend([x, y])
         c.create_line(*pts, fill=ACCENT, width=max(1, _sp(2)), smooth=True)
-        c.create_text(_sp(6), _sp(8), text=f"{hi:.1f}", fill=MUTED, anchor="w")
-        c.create_text(_sp(6), h - _sp(8), text=f"{lo:.1f}", fill=MUTED, anchor="w")
+        c.create_text(_sp(8), _sp(14), text=f"{hi:.1f}", fill=MUTED, anchor="w")
+        c.create_text(_sp(8), h - _sp(14), text=f"{lo:.1f}", fill=MUTED, anchor="w")
 
     def _log(self, text):
         # 界面构建过程中可能就会打日志，此时 ts_var 还不存在

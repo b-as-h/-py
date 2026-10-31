@@ -1,0 +1,2 @@
+# 运行依赖（Tkinter 为 Python 标准库，无需安装）
+pyserial>=3.5

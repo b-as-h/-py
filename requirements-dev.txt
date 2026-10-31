@@ -1,0 +1,5 @@
+# 开发与打包依赖
+-r requirements.txt
+
+# 生成 dist/STM32Host.exe
+pyinstaller>=6.0
