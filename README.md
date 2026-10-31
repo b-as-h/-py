@@ -2,9 +2,28 @@
 
 配套 STM32F103 桌面终端项目的 PC 端工具：通过 HC-05 / HC-06 蓝牙串口（或 USB-TTL）查看传感器数据、控制舵机、调试通信协议。
 
-- 固件工程：`E:\study\STM32Project\hal\Project`
-- 上位机目录：`E:\上位机`
-- 协议实现：`Core/Src/bt.c`、`Core/Inc/bt.h`
+- GitHub 仓库：<https://github.com/b-as-h/Host_computer-py>
+- 固件协议：`Core/Src/bt.c`、`Core/Inc/bt.h`（固件工程不在本仓库）
+- 界面技术：Python + Tkinter，无前端构建步骤
+- 显示适配：Windows Per-Monitor V2 DPI，1080p / 2K 自适应
+
+---
+
+## 界面预览
+
+以下截图全部由 [`tools/capture_screenshots.py`](tools/capture_screenshots.py) 使用固定虚拟数据生成，不需要开发板、串口或本机真实性能数据。
+
+### 主界面
+
+![主界面](screenshot.png)
+
+### 温度曲线与陀螺仪
+
+![温度曲线与陀螺仪](screenshots/trends.png)
+
+### 雷达扫描
+
+![雷达扫描](screenshots/radar.png)
 
 ---
 
@@ -39,43 +58,52 @@ python selftest.py
 全部通过（退出码 0）再插板子。这样一旦上板出问题，就能确定是接线 / 波特率 / 供电，
 而不是软件解析。改完协议先跑它，是成本最低的回归测试。
 
-### 打包成 exe / 发布
-
-已发布仓库：<https://github.com/b-as-h/-py>
+### 重新生成展示截图
 
 ```bat
-pyinstaller --noconfirm --onefile --windowed --icon app.ico ^
-  --collect-all serial ^
-  --add-binary "%CONDA_PREFIX%\Library\bin\tcl90.dll;." ^
-  --add-binary "%CONDA_PREFIX%\Library\bin\tcl9tk90.dll;." ^
-  --add-binary "%CONDA_PREFIX%\Library\bin\zlib1.dll;." ^
-  --add-binary "%CONDA_PREFIX%\Library\bin\ffi.dll;." ^
-  --add-binary "%CONDA_PREFIX%\Library\bin\liblzma.dll;." ^
-  --add-binary "%CONDA_PREFIX%\Library\bin\libbz2.dll;." ^
-  --name STM32Host host_monitor.py
+python tools/capture_screenshots.py
 ```
 
+脚本固定 Tk 缩放为 1.25，使用虚拟串口、性能快照和遥测数据，输出：
+
+- `screenshot.png`：主界面
+- `screenshots/trends.png`：温度曲线与陀螺仪
+- `screenshots/radar.png`：雷达扫描
+
+运行环境需要至少 1400×1020 的 Windows 桌面，不连接任何真实硬件。
+
+### 打包成 exe / 发布
+
+已发布仓库：<https://github.com/b-as-h/Host_computer-py>
+
+标准 Python 环境（需先安装 PyInstaller）：
+
+```bat
+python -m pip install pyinstaller
+pyinstaller --noconfirm --clean --onefile --windowed --icon app.ico ^
+  --collect-all serial --name STM32Host host_monitor.py
+```
+
+产物为 `dist\STM32Host.exe`。程序是单文件，运行时不需要 Python、源码目录或 `.workbuddy`。
+
 > conda 环境打包时，`_tkinter.pyd` 依赖的 `tcl90.dll` / `tcl9tk90.dll` 不会被自动收集，
-> 必须手动 `--add-binary`，否则运行时报 `DLL load failed while importing _tkinter`。
-> pyserial 也要 `--collect-all serial`，否则 exe 里检测不到串口。
->
-> **`ffi.dll` 同样必须手动加**。`_ctypes.pyd` 依赖 conda 的 `ffi.dll`，
-> 而 PyInstaller 解析不出来（构建日志里是一条 `Library not found: could not resolve 'ffi.dll'` 的警告，很容易忽略）。
-> 漏了它，exe 里 **所有用 ctypes 的模块都会挂**：`pyserial` 报"未安装"、
-> `sysinfo` 报"采集模块不可用"，但界面其它部分正常，很难联想到是 DLL 的问题。
-> `liblzma.dll` / `libbz2.dll` 是 `_lzma` / `_bz2` 的依赖，一并加上更稳妥。
+> 还需按原环境手动追加 `--add-binary "%CONDA_PREFIX%\Library\bin\..."`。
+> pyserial 使用 `--collect-all serial`，否则 exe 里可能检测不到串口。
+> 若 conda 的 `_ctypes.pyd` 依赖独立 `ffi.dll`，也要一并加入，否则 `sysinfo` 会报采集模块不可用。
 
 ## 二、文件说明
 
 | 文件 | 作用 |
 |---|---|
-| `host_monitor.py` | 主程序，tkinter 图形界面，无第三方依赖（除 pyserial） |
+| `host_monitor.py` | 主程序，Tkinter 图形界面，高 DPI 自适应，无第三方依赖（除 pyserial） |
 | `sysinfo.py` | 本机性能采集（CPU/GPU/内存/网络/FPS/温度），纯 ctypes，可单独 `python sysinfo.py` 自测 |
 | `run_host.bat` | 启动器，负责选解释器、装依赖、拉起界面 |
 | `selftest.py` | 离线自检，不需要开发板和串口，验证协议解析是否正常 |
-| `dist/STM32Host.exe` | 打包好的单文件 exe，免安装直接双击运行（约 13 MB） |
-| `screenshot.png` | 界面截图，仓库首页用 |
-| `app.ico` | 图标（32/48/64 三档），快捷方式用的就是它 |
+| `tools/capture_screenshots.py` | 用固定虚拟数据生成 README 展示截图 |
+| `dist/STM32Host.exe` | 打包好的单文件 exe，免安装直接双击运行（约 12 MB） |
+| `screenshot.png` | 主界面截图，仓库首页用 |
+| `screenshots/` | 趋势与雷达功能展示图 |
+| `app.ico` | 图标（32/48/64 三档） |
 | `README.md` | 本文档 |
 
 ## 三、环境要求
@@ -85,6 +113,7 @@ pyinstaller --noconfirm --onefile --windowed --icon app.ico ^
 | 系统 | Windows 7 及以上 |
 | Python | 3.8+，且安装时勾选了 `tcl/tk and IDLE` |
 | 依赖 | pyserial（启动器会自动安装） |
+| 显示 | 1080p 及以上；支持 100% / 125% / 150% 系统缩放 |
 | 硬件 | 蓝牙模块已与电脑配对，或 USB-TTL 直连开发板 |
 
 ## 四、连接步骤
@@ -101,13 +130,15 @@ pyinstaller --noconfirm --onefile --windowed --icon app.ico ^
 
 | 区域 | 内容 |
 |---|---|
-| 顶部 | 串口下拉、**波特率下拉**、刷新、连接、状态栏 |
+| 顶部 | 产品标题、连接状态灯、串口下拉、刷新、**波特率下拉**、同步设备速率、连接 |
 | 左栏顶部 | **电脑状态圆环**：CPU / GPU / RAM / NET / FPS，程序一打开就开始刷新，与串口是否连接无关 |
 | 左栏 | 光照、温度、湿度、片内温度、供电电压、三轴加速度、**温度曲线 + 陀螺仪**（并排对齐）、**雷达视图**（在曲线下方，滚轮下滚查看） |
-| 右栏 | 舵机角度滑条、舵机锁定、周期遥测开关、**雷达模式开关**、**发送电脑数据开关**、快捷命令按钮、同步设备波特率 |
-| 发送栏 | 命令输入框（回车即发）、发送、清空日志 |
-| 选项栏 | **自动追加回车**、**HEX 发送**、时间戳（默认开启）、定时发送 + 间隔 |
+| 右栏 | 舵机角度滑条、舵机锁定、周期遥测开关、**雷达模式开关**、**发送电脑数据开关**、快捷命令按钮 |
+| 发送栏 | 命令输入框（回车即发）、发送命令、清空日志 |
+| 选项栏 | **追加 CRLF**、**HEX 发送**、时间戳（默认开启）、定时发送 + 间隔、命令历史提示 |
 | 日志 | 收发记录，`>` 为发送、`<` 为接收、`!` 为异常 |
+
+界面使用统一深色视觉规范，连接状态、按钮悬停、等待应答、操作成功/失败都有对应反馈。窗口会根据屏幕工作区和系统 DPI 自动选择 0.9–1.5 倍 UI 缩放，2K 与 1080p 下不会出现整体位图拉伸。
 
 ### 陀螺仪面板
 
@@ -146,8 +177,8 @@ pyinstaller --noconfirm --onefile --windowed --icon app.ico ^
 
 | 功能 | 说明 |
 |---|---|
-| 自动追加回车 | 默认开启，发送时自动补 `\r\n`；取消后原样发送（固件按 `\r` 或 `\n` 断行） |
-| HEX 发送 | 支持 `AA 55 01`、`aa,55,0x01`、`AA5501` 三种写法，开启后忽略回车选项 |
+| 追加 CRLF | 默认开启，发送命令时自动补 `\r\n`；取消后原样发送（固件按 `\r` 或 `\n` 断行） |
+| HEX 发送 | 支持 `AA 55 01` 和 `aa,55,0x01` 两种写法，开启后忽略回车选项 |
 | 定时发送 | 按设定间隔重复发送输入框内容，最小 50ms |
 | 命令历史 | 输入框内按 `↑` / `↓` 翻历史命令 |
 | 快捷命令 | PING / GET / SYS / VER / HELP / RESET 六个按钮，等价于在输入框里输入 |
@@ -264,7 +295,7 @@ PC,cpu=21,mem=63,gpu=6,ct=-1,gt=-1,cf=4007,gc=-1,ru=101,rt=160,dn=7,up=12,fps=75
 ```
 连接中把下拉框切到 115200
         ↓
-点「同步设备波特率」
+点「同步设备速率」
         ↓
 上位机在旧链路(9600)上发 BAUD,115200     ← 命令必须走旧速率
         ↓
@@ -290,7 +321,8 @@ PC,cpu=21,mem=63,gpu=6,ct=-1,gt=-1,cf=4007,gc=-1,ru=101,rt=160,dn=7,up=12,fps=75
 | `-ERR,BAUD` | 波特率不在 9600/19200/38400/57600/115200 之内 |
 | 双击 bat 一闪而过 | 用 cmd 手动运行 `python host_monitor.py` 看报错 |
 | 图标显示成白纸 | 桌面按 F5 刷新，或重建图标缓存 |
-| 改了 `host_monitor.py` 不生效 | 关掉旧窗口重新双击启动器 |
+| 改了 `host_monitor.py` 但 exe 没变化 | 源码不会自动进入旧 exe，需重新执行 PyInstaller |
+| 界面文字发虚 | 确认使用新版 exe；旧版未声明 DPI 感知，在 125%/150% 缩放下会被系统拉伸 |
 
 ## 九、自己扩展
 
@@ -302,8 +334,9 @@ PC,cpu=21,mem=63,gpu=6,ct=-1,gt=-1,cf=4007,gc=-1,ru=101,rt=160,dn=7,up=12,fps=75
 
 | 版本 | 内容 |
 |---|---|
-| v1.4 | 增加**雷达视图**（半圆极坐标 + 30fps 补间扫描 + 渐隐拖尾 + 回波点）与「雷达模式」开关；协议增加 `RADAR,<0/1>[,<dps>]` 与 `$R` 帧；时间戳默认开启；修复 `clam` 主题复选框显示成"叉"的问题；左栏改为滚轮滚动，雷达图移到温度曲线下方、曲线与陀螺仪顶边对齐、移除重复的舵机读数；`selftest.py` 覆盖雷达收发 |
+| v1.6 | 重构界面视觉与信息层级，统一深色配色、字体、间距、圆角卡片和按钮状态；增加**Per-Monitor V2 DPI 感知**及 1080p / 2K 自适应缩放；重绘 Canvas 仪表、图表、陀螺仪、雷达和 DPI 复选框；新增虚拟数据截图工具与三张全功能展示图 |
 | v1.5 | 增加**电脑状态圆环**（CPU / GPU / RAM / NET / FPS，打开即刷新）与「发送电脑数据 1s」开关；新增 `sysinfo.py`（纯 ctypes 采集，含 PDH GPU 计数器、DWM 帧率、HWiNFO 温度）；协议增加 `PC,...` 帧；`selftest.py` 增加 9 项 PC 帧校验 |
+| v1.4 | 增加**雷达视图**（半圆极坐标 + 30fps 补间扫描 + 渐隐拖尾 + 回波点）与「雷达模式」开关；协议增加 `RADAR,<0/1>[,<dps>]` 与 `$R` 帧；时间戳默认开启；修复 `clam` 主题复选框显示成"叉"的问题；左栏改为滚轮滚动，雷达图移到温度曲线下方、曲线与陀螺仪顶边对齐、移除重复的舵机读数；`selftest.py` 覆盖雷达收发 |
 | v1.3 | 增加 `selftest.py` 离线自检；`+DATA` 的 `lock` / `servo` 字段回写到复选框与滑条（仅 `+DATA`，周期遥测不回写，避免覆盖用户操作） |
 | v1.2 | 增加陀螺仪面板（姿态气泡 + 三轴角速度条）；`GET` 与 `$D` 增加 `gx/gy/gz/roll/pitch` 字段；修复右侧控制栏被左栏挤压的问题 |
 | v1.1 | 增加波特率切换与同步设备波特率；增加自动回车、HEX 发送、时间戳、定时发送、命令历史、清空日志、快捷命令按钮；增加 PONG 超时提示 |

@@ -7,7 +7,7 @@ BASH-STM32 蓝牙上位机
 运行：双击 run_host.bat，或 python host_monitor.py
 
 功能：
-- 串口连接，波特率可切换（连接中切换会自动重连）
+- 串口连接，波特率可切换（连接中通过同步按钮安全切换）
 - 一键把设备波特率同步成当前选择（发送 BAUD 命令）
 - 实时显示光照、温度、湿度、片内温度、供电电压、加速度
 - 温度曲线（最近 120 个采样点）
@@ -17,12 +17,15 @@ BASH-STM32 蓝牙上位机
 协议见 README「蓝牙串口协议」一节。
 """
 
+import ctypes
 import math
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from ctypes import wintypes
+from tkinter import ttk, messagebox, font as tkfont
 
 try:
     import serial
@@ -44,12 +47,165 @@ RADAR_MAX_CM = 200          # 雷达视图量程，超过的点压在边缘
 RADAR_DPS = 60              # 雷达扫描角速度，与固件默认一致
 RADAR_TRAIL = 14            # 扫描线拖尾的条数
 
-BG = "#1b1b1f"
-PANEL = "#26262b"
-FG = "#e6e6e6"
-MUTED = "#9a9aa2"
-ACCENT = "#5dcaa5"
-WARN = "#ef9f27"
+# 统一的桌面工具视觉规范：低亮度底色、分层面板、单一强调色。
+BG = "#10151b"
+PANEL = "#1a222b"
+PANEL_ALT = "#222d38"
+FG = "#edf3f7"
+MUTED = "#93a4b3"
+ACCENT = "#4fc3a1"
+ACCENT_HOVER = "#6dd6b6"
+WARN = "#f0ad4e"
+DANGER = "#ef6a70"
+INFO = "#65a9e8"
+BORDER = "#31404d"
+INPUT = "#121a22"
+SHADOW = "#090d11"
+FONT_UI = "Microsoft YaHei UI"
+FONT_MONO = "Consolas"
+UI_SCALE = 1.0
+
+
+def _sp(value):
+    """把 96 DPI 下的设计像素换算成当前界面像素。"""
+    return max(1, int(round(value * UI_SCALE)))
+
+
+def enable_dpi_awareness():
+    """必须在 tk.Tk() 前调用，避免 Windows 对整窗做位图拉伸。"""
+    if sys.platform != "win32":
+        return
+    user32 = ctypes.windll.user32
+    try:
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def _work_area():
+    """返回主屏工作区，避开任务栏；失败时回退到 Tk 屏幕尺寸。"""
+    if sys.platform == "win32":
+        rect = wintypes.RECT()
+        try:
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    0x0030, 0, ctypes.byref(rect), 0):
+                return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+        except Exception:
+            pass
+    return 0, 0, 0, 0
+
+
+def _ui_scale_for(root, work_w, work_h):
+    """综合系统 DPI、屏幕尺寸和可用工作区，得到克制的 UI 缩放。"""
+    dpi = float(root.winfo_fpixels("1i"))
+    dpi_scale = dpi / 96.0
+    work_w = work_w or root.winfo_screenwidth()
+    work_h = work_h or root.winfo_screenheight()
+    # 2K/1080 下让界面占到合适视觉面积；不是简单把所有元素放大 1.5 倍。
+    preferred = max(1.0, min(1.40, work_w / 1900.0, work_h / 1080.0))
+    fit_w = max(0.90, (work_w - 32) / 1100.0)
+    fit_h = max(0.90, (work_h - 60) / 780.0)
+    return max(0.90, min(max(dpi_scale, preferred), 1.50, fit_w, fit_h))
+
+
+def _rounded_points(x1, y1, x2, y2, radius, steps=8):
+    """生成圆角矩形顶点，供 Canvas 卡片使用。"""
+    points = []
+    for cx, cy, start in ((x2 - radius, y1 + radius, -90),
+                          (x2 - radius, y2 - radius, 0),
+                          (x1 + radius, y2 - radius, 90),
+                          (x1 + radius, y1 + radius, 180)):
+        for i in range(steps + 1):
+            angle = math.radians(start + i * 90 / steps)
+            points.extend((cx + radius * math.cos(angle),
+                           cy + radius * math.sin(angle)))
+    return points
+
+
+class RoundedCard(tk.Canvas):
+    """轻量圆角卡片；真实内容放在 body 中，不增加额外依赖。"""
+
+    def __init__(self, master, radius=None, fill=PANEL, **kwargs):
+        super().__init__(master, bg=BG, bd=0, highlightthickness=0, **kwargs)
+        self.radius = radius if radius is not None else _sp(14)
+        self.card_fill = fill
+        self.body = tk.Frame(self, bg=fill)
+        self._body_window = self.create_window(2, 2, window=self.body, anchor="nw")
+        self.bind("<Configure>", self._draw_card)
+
+    def _draw_card(self, _event=None):
+        w, h = max(8, self.winfo_width()), max(8, self.winfo_height())
+        r = min(self.radius, w // 3, h // 3)
+        self.delete("card-shadow")
+        self.delete("card-body")
+        self.create_polygon(_rounded_points(3, _sp(4), w - 1, h - 1, r),
+                            smooth=False, fill=SHADOW, outline="", tags="card-shadow")
+        self.create_polygon(_rounded_points(1, 1, w - 3, h - _sp(4), r),
+                            smooth=False, fill=self.card_fill, outline=BORDER,
+                            width=1, tags="card-body")
+        self.itemconfigure(self._body_window, width=w - 6, height=h - _sp(7))
+        self.coords(self._body_window, 2, 2)
+        self.tag_raise(self._body_window)
+
+
+class ActionButton(tk.Button):
+    """统一按钮的默认、悬停、按下、禁用和加载状态。"""
+
+    VARIANTS = {
+        "primary": (ACCENT, "#10231d", ACCENT_HOVER, "#10231d"),
+        "secondary": (PANEL_ALT, FG, BORDER, FG),
+        "ghost": (PANEL, MUTED, PANEL_ALT, FG),
+        "danger": ("#48262b", "#ffd9dc", "#683039", "#ffffff"),
+    }
+
+    def __init__(self, master, variant="secondary", **kwargs):
+        bg, fg, hover, active = self.VARIANTS[variant]
+        kwargs.setdefault("bg", bg)
+        kwargs.setdefault("fg", fg)
+        kwargs.setdefault("activebackground", hover)
+        kwargs.setdefault("activeforeground", active)
+        kwargs.setdefault("disabledforeground", "#63717d")
+        kwargs.setdefault("font", (FONT_UI, 10, "bold"))
+        kwargs.setdefault("relief", "flat")
+        kwargs.setdefault("bd", 0)
+        kwargs.setdefault("padx", _sp(12))
+        kwargs.setdefault("pady", _sp(6))
+        kwargs.setdefault("cursor", "hand2")
+        kwargs.setdefault("highlightthickness", 0)
+        super().__init__(master, **kwargs)
+        self.variant = variant
+        self._hover_bg = hover
+        self._loading = False
+        self._loading_text = ""
+        self._normal_text = self.cget("text")
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+
+    def _on_enter(self, _event=None):
+        if str(self.cget("state")) != "disabled" and not self._loading:
+            self.configure(bg=self._hover_bg)
+
+    def _on_leave(self, _event=None):
+        if not self._loading:
+            self.configure(bg=self.VARIANTS[self.variant][0])
+
+    def set_loading(self, loading, text="处理中…"):
+        self._loading = loading
+        if loading:
+            self._normal_text = self.cget("text")
+            self.configure(text=text, bg=INPUT, fg=MUTED, cursor="watch")
+        else:
+            self.configure(text=self._normal_text,
+                           bg=self.VARIANTS[self.variant][0],
+                           fg=self.VARIANTS[self.variant][1], cursor="hand2")
 
 
 def _fmt_speed(kbs):
@@ -111,70 +267,140 @@ class MonitorApp:
 
     # ---------- 界面 ----------
     def _build_ui(self):
-        self.root.title("BASH-STM32 蓝牙上位机")
+        global UI_SCALE
+        self.root.title("STM32 Host · 桌面监控终端")
         self.root.configure(bg=BG)
-        self.root.geometry("960x730")
-        self.root.minsize(880, 660)
 
+        work_x, work_y, work_w, work_h = _work_area()
+        if not work_w or not work_h:
+            work_x, work_y = 0, 0
+            work_w = self.root.winfo_screenwidth()
+            work_h = self.root.winfo_screenheight()
+        UI_SCALE = _ui_scale_for(self.root, work_w, work_h)
+        self.root.tk.call("tk", "scaling", 96.0 * UI_SCALE / 72.0)
+        self.ui_scale = UI_SCALE
+
+        win_w = min(_sp(1100), work_w - _sp(24))
+        win_h = min(_sp(780), work_h - _sp(40))
+        pos_x = work_x + max(_sp(8), (work_w - win_w) // 2)
+        pos_y = work_y + max(_sp(8), (work_h - win_h) // 2)
+        self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+        self.root.minsize(min(_sp(980), work_w - _sp(24)),
+                          min(_sp(700), work_h - _sp(40)))
+
+        # 统一 Tk/ttk 字体，避免不同控件回退到不同系统字体。
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            tkfont.nametofont(name).configure(family=FONT_UI, size=10)
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("TFrame", background=BG)
-        style.configure("TLabel", background=BG, foreground=FG, font=("Consolas", 10))
-        style.configure("Muted.TLabel", foreground=MUTED)
+        style.configure("TFrame", background=PANEL)
+        style.configure("TLabel", background=PANEL, foreground=FG,
+                        font=(FONT_UI, 10))
+        style.configure("Muted.TLabel", foreground=MUTED, font=(FONT_UI, 10))
         style.configure("Warn.TLabel", foreground=WARN)
-        style.configure("Value.TLabel", foreground=ACCENT, font=("Consolas", 16, "bold"))
-        style.configure("TButton", font=("Microsoft YaHei UI", 9))
-        style.configure("Small.TButton", font=("Consolas", 9))
-        style.configure("TCheckbutton", background=BG, foreground=FG)
-        style.configure("TCombobox", fieldbackground=PANEL)
-        style.configure("TEntry", fieldbackground=PANEL, foreground=FG)
-        # clam 主题自带的复选框指示器画的是一个"叉"，换成自己画的方框 + 对勾
+        style.configure("Success.TLabel", foreground=ACCENT)
+        style.configure("Danger.TLabel", foreground=DANGER)
+        style.configure("Section.TLabel", foreground=FG, font=(FONT_UI, 11, "bold"))
+        style.configure("Title.TLabel", foreground=FG, font=(FONT_UI, 15, "bold"))
+        style.configure("Value.TLabel", background=PANEL_ALT, foreground=ACCENT,
+                        font=(FONT_MONO, 15, "bold"))
+        style.configure("TCheckbutton", background=PANEL, foreground=FG,
+                        font=(FONT_UI, 10), padding=(0, _sp(2)))
+        style.map("TCheckbutton", background=[("active", PANEL)],
+                  foreground=[("disabled", "#63717d"), ("active", ACCENT_HOVER)])
+        style.configure("TCombobox", fieldbackground=INPUT, background=PANEL_ALT,
+                        foreground=FG, arrowcolor=MUTED, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER,
+                        padding=_sp(5))
+        style.map("TCombobox", fieldbackground=[("readonly", INPUT)],
+                  foreground=[("readonly", FG)],
+                  bordercolor=[("focus", ACCENT)],
+                  arrowcolor=[("active", ACCENT)])
+        style.configure("TEntry", fieldbackground=INPUT, foreground=FG,
+                        insertcolor=FG, bordercolor=BORDER, lightcolor=BORDER,
+                        darkcolor=BORDER, padding=_sp(6))
+        style.map("TEntry", bordercolor=[("focus", ACCENT)])
+        style.configure("Horizontal.TScale", background=PANEL, troughcolor=INPUT,
+                        bordercolor=INPUT, lightcolor=ACCENT, darkcolor=ACCENT)
+        style.configure("TSeparator", background=BORDER)
+        style.configure("Vertical.TScrollbar", background=PANEL_ALT,
+                        troughcolor=PANEL, bordercolor=PANEL, arrowcolor=MUTED)
         self._install_dark_check(style)
 
-        # ---- 顶部：串口 + 波特率 ----
-        top = ttk.Frame(self.root, padding=(12, 10, 12, 6))
-        top.pack(fill="x")
+        outer = tk.Frame(self.root, bg=BG, padx=_sp(16), pady=_sp(14))
+        outer.pack(fill="both", expand=True)
 
-        ttk.Label(top, text="串口").pack(side="left")
+        # ---- 顶部：产品标识、连接状态和串口参数 ----
+        top_card = RoundedCard(outer, height=_sp(104))
+        self.top_card = top_card
+        top_card.pack(fill="x", pady=(0, _sp(12)))
+        top = tk.Frame(top_card.body, bg=PANEL, padx=_sp(14), pady=_sp(10))
+        top.pack(fill="both", expand=True)
+        header = tk.Frame(top, bg=PANEL)
+        header.pack(fill="x", pady=(0, _sp(8)))
+        ttk.Label(header, text="STM32 HOST", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="桌面监控与串口调试终端",
+                  style="Muted.TLabel").pack(side="left", padx=(_sp(12), 0),
+                                               pady=(_sp(4), 0))
+        self.status = ttk.Label(header, text="未连接", style="Muted.TLabel")
+        self.status.pack(side="right", pady=(_sp(4), 0))
+        dot = _sp(10)
+        self.status_dot = tk.Canvas(header, width=dot, height=dot, bg=PANEL,
+                                    highlightthickness=0)
+        self.status_dot.pack(side="right", padx=(_sp(10), _sp(6)),
+                             pady=(_sp(7), 0))
+        self._status_circle = self.status_dot.create_oval(
+            1, 1, dot - 1, dot - 1, fill=MUTED, outline="")
+        self.toast = tk.Label(header, text="", bg=PANEL_ALT, fg=ACCENT,
+                              font=(FONT_UI, 10), padx=_sp(8), pady=_sp(3))
+        self.toast.pack(side="right", padx=(_sp(4), _sp(14)), pady=(_sp(2), 0))
+
+        controls = tk.Frame(top, bg=PANEL)
+        controls.pack(fill="x")
+        ttk.Label(controls, text="串口", style="Muted.TLabel").pack(side="left")
         self.port_var = tk.StringVar()
-        self.port_box = ttk.Combobox(top, textvariable=self.port_var, width=26, state="readonly")
-        self.port_box.pack(side="left", padx=(6, 12))
-
-        ttk.Button(top, text="刷新", width=6, command=self._refresh_ports).pack(side="left")
-
-        ttk.Label(top, text="波特率").pack(side="left", padx=(16, 0))
+        self.port_box = ttk.Combobox(controls, textvariable=self.port_var,
+                                     width=31, state="readonly")
+        self.port_box.pack(side="left", padx=(_sp(7), _sp(8)))
+        self.refresh_btn = ActionButton(controls, text="刷新", variant="secondary",
+                                        command=self._refresh_ports)
+        self.refresh_btn.pack(side="left")
+        ttk.Label(controls, text="波特率", style="Muted.TLabel").pack(
+            side="left", padx=(_sp(20), 0))
         self.baud_var = tk.StringVar(value=DEFAULT_BAUD)
-        self.baud_box = ttk.Combobox(top, textvariable=self.baud_var, values=BAUD_CHOICES,
-                                     width=9, state="readonly")
-        self.baud_box.pack(side="left", padx=6)
+        self.baud_box = ttk.Combobox(controls, textvariable=self.baud_var,
+                                     values=BAUD_CHOICES,
+                                     width=10, state="readonly")
+        self.baud_box.pack(side="left", padx=(_sp(7), _sp(8)))
         self.baud_box.bind("<<ComboboxSelected>>", self._on_baud_change)
+        self.connect_btn = ActionButton(controls, text="连接设备", width=12,
+                                        variant="primary", command=self._toggle_connect)
+        self.connect_btn.pack(side="right")
+        ActionButton(controls, text="同步设备速率", width=13, variant="secondary",
+                     command=self._sync_device_baud).pack(side="right", padx=(0, _sp(8)))
 
-        self.connect_btn = ttk.Button(top, text="连接", width=8, command=self._toggle_connect)
-        self.connect_btn.pack(side="left", padx=(10, 6))
-        self.status = ttk.Label(top, text="未连接", style="Muted.TLabel")
-        self.status.pack(side="left", padx=6)
-
-        # ---- 主体 ----
-        body = ttk.Frame(self.root, padding=(12, 0))
+        # ---- 主体：右侧控制固定宽度，左侧监控区自适应 ----
+        body = tk.Frame(outer, bg=BG)
         body.pack(fill="both", expand=True)
+        right_card = RoundedCard(body, width=_sp(244))
+        self.right_card = right_card
+        right_card.pack(side="right", fill="y", padx=(_sp(12), 0))
+        right = tk.Frame(right_card.body, bg=PANEL, padx=_sp(16), pady=_sp(10))
+        self.right_panel = right
+        right.pack(fill="both", expand=True)
 
-        # 注意：右栏必须先 pack，否则左栏 expand=True 会把它挤成一条缝
-        right = ttk.Frame(body, padding=(14, 0, 0, 0))
-        right.pack(side="right", fill="y")
-
-        # ---- 左栏（可滚动）----
-        # 内容高度超过窗口，用 Canvas + 内嵌 Frame 做垂直滚动，鼠标滚轮控制
-        scroll_host = ttk.Frame(body)
+        scroll_host = RoundedCard(body)
         scroll_host.pack(side="left", fill="both", expand=True)
-
-        self.scroll = tk.Canvas(scroll_host, bg=BG, highlightthickness=0,
-                                yscrollincrement=24)
-        vbar = ttk.Scrollbar(scroll_host, orient="vertical", command=self.scroll.yview)
+        scroll_box = tk.Frame(scroll_host.body, bg=PANEL)
+        scroll_box.pack(fill="both", expand=True)
+        self.scroll = tk.Canvas(scroll_box, bg=PANEL, highlightthickness=0,
+                                yscrollincrement=_sp(24))
+        vbar = ttk.Scrollbar(scroll_box, orient="vertical", command=self.scroll.yview)
         self.scroll.configure(yscrollcommand=vbar.set)
-        vbar.pack(side="right", fill="y")
+        vbar.pack(side="right", fill="y", padx=(0, _sp(2)), pady=_sp(2))
         self.scroll.pack(side="left", fill="both", expand=True)
 
-        left = ttk.Frame(self.scroll)
+        left = tk.Frame(self.scroll, bg=PANEL, padx=_sp(14), pady=_sp(12))
         self._left_win = self.scroll.create_window((0, 0), window=left, anchor="nw")
         left.bind("<Configure>",
                   lambda e: self.scroll.configure(scrollregion=self.scroll.bbox("all")))
@@ -182,171 +408,241 @@ class MonitorApp:
                          lambda e: self.scroll.itemconfigure(self._left_win, width=e.width))
 
         # ---- 电脑状态（圆环）：程序打开即开始刷新，与串口是否连接无关 ----
-        ttk.Label(left, text="电脑状态", style="Muted.TLabel").pack(anchor="w", pady=(2, 2))
-        self.sys_canvas = tk.Canvas(left, height=148, bg=PANEL, highlightthickness=0)
+        sys_head = tk.Frame(left, bg=PANEL)
+        sys_head.pack(fill="x", pady=(0, _sp(2)))
+        ttk.Label(sys_head, text="电脑性能", style="Section.TLabel").pack(side="left")
+        tk.Label(sys_head, text="LIVE · 1s", bg=PANEL, fg=ACCENT,
+                 font=(FONT_MONO, 10)).pack(side="right", pady=(_sp(3), 0))
+        self.sys_canvas = tk.Canvas(left, height=_sp(148), bg=PANEL,
+                                    highlightthickness=0)
         self.sys_canvas.pack(fill="x")
         self.sys_canvas.bind("<Configure>", lambda e: self._draw_sysinfo())
 
-        grid = ttk.Frame(left)
-        grid.pack(fill="x", pady=(0, 6))
+        data_head = tk.Frame(left, bg=PANEL)
+        data_head.pack(fill="x", pady=(_sp(4), _sp(4)))
+        ttk.Label(data_head, text="传感器数据", style="Section.TLabel").pack(side="left")
+        ttk.Label(data_head, text="设备实时快照", style="Muted.TLabel").pack(
+            side="right", pady=(_sp(3), 0))
+        grid = tk.Frame(left, bg=PANEL)
+        grid.pack(fill="x", pady=(0, _sp(8)))
+        for col in range(3):
+            grid.columnconfigure(col, weight=1, uniform="sensor")
         self.value_labels = {}
         fields = [
             ("光照", "light", "%"), ("温度", "temp", "℃"), ("湿度", "humi", "%"),
             ("片内温度", "chip", "℃"), ("供电", "vdd", "mV"),
         ]
         for i, (name, key, unit) in enumerate(fields):
-            cell = ttk.Frame(grid)
-            cell.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 26), pady=4)
-            ttk.Label(cell, text=name, style="Muted.TLabel").pack(anchor="w")
-            row = ttk.Frame(cell)
-            row.pack(anchor="w")
-            lbl = ttk.Label(row, text="--", style="Value.TLabel")
+            cell = tk.Frame(grid, bg=PANEL_ALT, padx=_sp(10), pady=_sp(8))
+            cell.grid(row=i // 3, column=i % 3, sticky="nsew",
+                      padx=_sp(4), pady=_sp(4))
+            tk.Label(cell, text=name, bg=PANEL_ALT, fg=MUTED,
+                     font=(FONT_UI, 10)).pack(anchor="w")
+            row = tk.Frame(cell, bg=PANEL_ALT)
+            row.pack(fill="x", pady=(_sp(3), 0))
+            lbl = ttk.Label(row, text="--", style="Value.TLabel", width=7, anchor="w")
             lbl.pack(side="left")
-            ttk.Label(row, text=unit, style="Muted.TLabel").pack(side="left", padx=(2, 0))
+            tk.Label(row, text=unit, bg=PANEL_ALT, fg=MUTED,
+                     font=(FONT_UI, 10)).pack(side="left", padx=(_sp(4), 0),
+                                               pady=(_sp(4), 0))
             self.value_labels[key] = lbl
 
-        acc = ttk.Frame(left)
-        acc.pack(fill="x", pady=(0, 6))
-        ttk.Label(acc, text="加速度 (g)", style="Muted.TLabel").pack(anchor="w")
-        self.acc_label = ttk.Label(acc, text="ax --   ay --   az --")
-        self.acc_label.pack(anchor="w")
+        acc = tk.Frame(left, bg=PANEL_ALT, padx=_sp(10), pady=_sp(8))
+        acc.pack(fill="x", pady=(_sp(4), _sp(10)))
+        tk.Label(acc, text="三轴加速度", bg=PANEL_ALT, fg=MUTED,
+                 font=(FONT_UI, 10)).pack(side="left")
+        self.acc_label = tk.Label(acc, text="ax --   ay --   az --   g", bg=PANEL_ALT,
+                                  fg=FG, font=(FONT_MONO, 11, "bold"))
+        self.acc_label.pack(side="right")
 
-        ttk.Label(left, text="温度曲线 / 陀螺仪", style="Muted.TLabel").pack(anchor="w", pady=(6, 2))
+        chart_head = tk.Frame(left, bg=PANEL)
+        self.chart_head = chart_head
+        chart_head.pack(fill="x", pady=(_sp(4), _sp(4)))
+        ttk.Label(chart_head, text="趋势与姿态", style="Section.TLabel").pack(side="left")
+        ttk.Label(chart_head, text="温度历史 / 陀螺仪",
+                  style="Muted.TLabel").pack(side="right", pady=(_sp(3), 0))
 
         # 两块画布给同一个高度，左右顶边才会严格对齐（之前 Notebook 的标签栏
         # 会把温度曲线整体压下去，和右边的陀螺仪错开二十多像素）
-        chart_h = 180
+        chart_h = _sp(180)
         charts = ttk.Frame(left)
         charts.pack(fill="x")
 
-        self.canvas = tk.Canvas(charts, height=chart_h, bg=PANEL, highlightthickness=0)
+        self.canvas = tk.Canvas(charts, height=chart_h, bg=PANEL_ALT,
+                                highlightthickness=0)
         self.canvas.pack(side="left", fill="both", expand=True)
 
-        gyro_col = ttk.Frame(charts, padding=(12, 0, 0, 0))
+        gyro_col = ttk.Frame(charts, padding=(_sp(10), 0, 0, 0))
         gyro_col.pack(side="right", fill="y")
-        self.gyro = tk.Canvas(gyro_col, width=300, height=chart_h, bg=PANEL,
-                              highlightthickness=0)
+        self.gyro = tk.Canvas(gyro_col, width=_sp(300), height=chart_h,
+                              bg=PANEL_ALT, highlightthickness=0)
         self.gyro.pack(fill="both", expand=True)
         self.gyro.bind("<Configure>", lambda e: self._draw_gyro())
 
         # 雷达图单独占一块，放在温度曲线下方，靠滚轮往下滚才能看到
-        ttk.Label(left, text="雷达", style="Muted.TLabel").pack(anchor="w", pady=(10, 2))
-        self.radar = tk.Canvas(left, height=260, bg=PANEL, highlightthickness=0)
-        self.radar.pack(fill="x")
+        radar_head = tk.Frame(left, bg=PANEL)
+        self.radar_head = radar_head
+        radar_head.pack(fill="x", pady=(_sp(12), _sp(4)))
+        ttk.Label(radar_head, text="雷达扫描", style="Section.TLabel").pack(side="left")
+        ttk.Label(radar_head, text=f"0—180°  ·  {RADAR_MAX_CM} cm",
+                  style="Muted.TLabel").pack(side="right", pady=(_sp(3), 0))
+        self.radar = tk.Canvas(left, height=_sp(260), bg=PANEL_ALT,
+                               highlightthickness=0)
+        self.radar.pack(fill="x", pady=(0, _sp(4)))
         self.radar.bind("<Configure>", lambda e: self._draw_radar())
         self.root.bind_all("<MouseWheel>", self._on_wheel)
 
         # ---- 右侧控制 ----
-        ttk.Label(right, text="舵机角度").pack(anchor="w")
-        self.angle_label = ttk.Label(right, text="90°")
+        ttk.Label(right, text="设备控制", style="Section.TLabel").pack(
+            anchor="w", pady=(0, _sp(7)))
+        ttk.Label(right, text="舵机角度", style="Muted.TLabel").pack(anchor="w")
+        self.angle_label = tk.Label(right, text="90°", bg=PANEL, fg=FG,
+                                    font=(FONT_MONO, 21, "bold"))
         self.angle_label.pack(anchor="w")
         self.scale = ttk.Scale(right, from_=0, to=180, orient="horizontal",
-                               length=200, command=self._on_slider)
+                               length=_sp(200), command=self._on_slider)
         self.scale.set(90)
-        self.scale.pack(anchor="w", pady=(0, 2))
-        ttk.Button(right, text="发送角度", command=self._send_servo).pack(anchor="w", pady=(0, 8))
+        self.scale.pack(fill="x", pady=(0, _sp(5)))
+        ActionButton(right, text="发送角度", variant="primary", pady=_sp(4),
+                     command=self._send_servo).pack(fill="x", pady=(0, _sp(7)))
 
         self.lock_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(right, text="舵机锁定", variable=self.lock_var,
-                        command=self._send_lock).pack(anchor="w", pady=1)
+                        command=self._send_lock).pack(anchor="w", fill="x")
 
         self.stream_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(right, text="周期遥测 500ms", variable=self.stream_var,
-                        command=self._send_stream).pack(anchor="w", pady=1)
+        ttk.Checkbutton(right, text="周期遥测  500 ms", variable=self.stream_var,
+                        command=self._send_stream).pack(anchor="w", fill="x")
 
         self.radar_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(right, text=f"雷达模式 {RADAR_DPS}°/s", variable=self.radar_var,
-                        command=self._send_radar).pack(anchor="w", pady=1)
+        ttk.Checkbutton(right, text=f"雷达模式  {RADAR_DPS}°/s", variable=self.radar_var,
+                        command=self._send_radar).pack(anchor="w", fill="x")
 
         self.pcdata_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(right, text="发送电脑数据 1s", variable=self.pcdata_var,
-                        command=self._toggle_pcdata).pack(anchor="w", pady=1)
-        ttk.Label(right, text="把电脑状态每秒推给 STM32",
-                  style="Muted.TLabel", justify="left").pack(anchor="w", pady=(0, 0))
+        ttk.Checkbutton(right, text="发送电脑数据  1s", variable=self.pcdata_var,
+                        command=self._toggle_pcdata).pack(anchor="w", fill="x")
 
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=_sp(8))
 
-        ttk.Label(right, text="快捷命令", style="Muted.TLabel").pack(anchor="w", pady=(0, 3))
-        quick = ttk.Frame(right)
-        quick.pack(anchor="w")
+        ttk.Label(right, text="快捷命令", style="Muted.TLabel").pack(
+            anchor="w", pady=(0, _sp(3)))
+        quick = tk.Frame(right, bg=PANEL)
+        quick.pack(fill="x")
+        for col in range(3):
+            quick.columnconfigure(col, weight=1, uniform="quick")
         for i, cmd in enumerate(["PING", "GET", "SYS", "VER", "HELP", "RESET"]):
-            ttk.Button(quick, text=cmd, width=7, style="Small.TButton",
-                       command=lambda c=cmd: self._send(c)).grid(
-                row=i // 2, column=i % 2, padx=2, pady=2)
+            ActionButton(quick, text=cmd, width=5, padx=_sp(5), pady=_sp(4),
+                         variant="danger" if cmd == "RESET" else "secondary",
+                         command=lambda c=cmd: self._send(c)).grid(
+                row=i // 3, column=i % 3, padx=_sp(3), pady=_sp(3), sticky="ew")
 
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
-        ttk.Button(right, text="同步设备波特率", command=self._sync_device_baud).pack(anchor="w")
-        ttk.Label(right, text="把设备切到当前波特率\n（掉电恢复 9600）",
-                  style="Muted.TLabel", justify="left").pack(anchor="w", pady=(2, 0))
+        # ---- 底部：串口命令与日志终端 ----
+        bottom_card = RoundedCard(outer, height=_sp(214))
+        self.bottom_card = bottom_card
+        bottom_card.pack(fill="x", pady=(_sp(12), 0))
+        bottom = tk.Frame(bottom_card.body, bg=PANEL, padx=_sp(14), pady=_sp(10))
+        bottom.pack(fill="both", expand=True)
+        log_head = tk.Frame(bottom, bg=PANEL)
+        log_head.pack(fill="x", pady=(0, _sp(7)))
+        ttk.Label(log_head, text="串口终端", style="Section.TLabel").pack(side="left")
+        ttk.Label(log_head, text="> 发送   < 接收   ! 异常",
+                  style="Muted.TLabel").pack(side="right")
 
-        # ---- 发送栏 ----
-        send_bar = ttk.Frame(self.root, padding=(12, 8, 12, 4))
-        send_bar.pack(fill="x")
-
-        ttk.Label(send_bar, text="发送").pack(side="left")
+        send_bar = tk.Frame(bottom, bg=PANEL)
+        send_bar.pack(fill="x", pady=(0, _sp(6)))
         self.cmd_var = tk.StringVar()
-        self.cmd_entry = ttk.Entry(send_bar, textvariable=self.cmd_var, font=("Consolas", 10))
-        self.cmd_entry.pack(side="left", fill="x", expand=True, padx=6)
+        self.cmd_entry = ttk.Entry(send_bar, textvariable=self.cmd_var,
+                                   font=(FONT_MONO, 10))
+        self.cmd_entry.pack(side="left", fill="x", expand=True, padx=(0, _sp(8)))
         self.cmd_entry.bind("<Return>", lambda e: self._send_custom())
         self.cmd_entry.bind("<Up>", self._hist_prev)
         self.cmd_entry.bind("<Down>", self._hist_next)
+        ActionButton(send_bar, text="发送命令", variant="primary",
+                     command=self._send_custom).pack(side="left")
+        ActionButton(send_bar, text="清空", variant="secondary",
+                     command=self._clear_log).pack(side="left", padx=(_sp(8), 0))
 
-        ttk.Button(send_bar, text="发送", width=6, command=self._send_custom).pack(side="left")
-        ttk.Button(send_bar, text="清空日志", width=8,
-                   command=self._clear_log).pack(side="left", padx=(6, 0))
-
-        # ---- 选项栏 ----
-        opts = ttk.Frame(self.root, padding=(12, 0, 12, 4))
-        opts.pack(fill="x")
-
+        opts = tk.Frame(bottom, bg=PANEL)
+        opts.pack(fill="x", pady=(0, _sp(7)))
         self.crlf_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="自动追加回车 (\\r\\n)", variable=self.crlf_var).pack(side="left")
-
+        ttk.Checkbutton(opts, text="追加 CRLF", variable=self.crlf_var).pack(side="left")
         self.hex_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="HEX 发送", variable=self.hex_var).pack(side="left", padx=(14, 0))
-
+        ttk.Checkbutton(opts, text="HEX 发送", variable=self.hex_var).pack(
+            side="left", padx=(_sp(12), 0))
         self.ts_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="时间戳", variable=self.ts_var).pack(side="left", padx=(14, 0))
-
+        ttk.Checkbutton(opts, text="时间戳", variable=self.ts_var).pack(
+            side="left", padx=(_sp(12), 0))
         self.timer_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="定时发送", variable=self.timer_var).pack(side="left", padx=(14, 0))
+        ttk.Checkbutton(opts, text="定时发送", variable=self.timer_var).pack(
+            side="left", padx=(_sp(12), 0))
         self.period_var = tk.StringVar(value="1000")
-        ttk.Entry(opts, textvariable=self.period_var, width=6).pack(side="left", padx=(4, 2))
+        ttk.Entry(opts, textvariable=self.period_var, width=6).pack(
+            side="left", padx=(_sp(3), _sp(3)))
         ttk.Label(opts, text="ms", style="Muted.TLabel").pack(side="left")
+        ttk.Label(opts, text="↑ / ↓ 历史命令", style="Muted.TLabel").pack(side="right")
 
-        # ---- 日志 ----
-        log_frame = ttk.Frame(self.root, padding=(12, 0, 12, 10))
-        log_frame.pack(fill="both")
-        self.log = tk.Text(log_frame, height=8, bg=PANEL, fg=MUTED, bd=0,
-                           font=("Consolas", 9), insertbackground=FG)
-        self.log.pack(fill="both", expand=True)
+        log_frame = tk.Frame(bottom, bg=BORDER, padx=1, pady=1)
+        log_frame.pack(fill="both", expand=True)
+        self.log = tk.Text(log_frame, height=6, bg=INPUT, fg="#b8c7d3", bd=0,
+                           font=(FONT_MONO, 10), insertbackground=FG,
+                           selectbackground=BORDER, selectforeground=FG,
+                           padx=_sp(9), pady=_sp(7),
+                           spacing1=_sp(1), spacing3=_sp(1),
+                           yscrollcommand=lambda *args: log_scroll.set(*args))
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
         self.log.configure(state="disabled")
 
         # 串口枚举放在最后：它可能触发日志输出，此时所有控件必须已就绪
         self._refresh_ports()
 
-    def _install_dark_check(self, style):
-        """把 ttk.Checkbutton 的指示器换成自绘的深色方框 + 对勾。
+    def _set_status(self, text, tone="muted"):
+        """同步状态文字和状态灯，避免多处的视觉状态不一致。"""
+        styles = {"muted": "Muted.TLabel", "warn": "Warn.TLabel",
+                  "ok": "Success.TLabel", "error": "Danger.TLabel"}
+        colors = {"muted": MUTED, "warn": WARN, "ok": ACCENT, "error": DANGER}
+        self.status.configure(text=text, style=styles.get(tone, "Muted.TLabel"))
+        self.status_dot.itemconfigure(self._status_circle,
+                                      fill=colors.get(tone, MUTED))
 
-        clam 主题默认用一条交叉线表示"选中"，在深色界面上看起来就是个叉，
-        容易误读成"未选中/错误"。这里直接生成两张 14x14 的位图做指示器。
-        """
+    def _notify(self, text, tone=ACCENT, duration=1400):
+        """轻量操作反馈；新消息替换旧消息，不堆积定时器和动画。"""
+        old_job = getattr(self, "_toast_job", None)
+        if old_job is not None:
+            try:
+                self.root.after_cancel(old_job)
+            except tk.TclError:
+                pass
+        self.toast.configure(text=text, fg=tone)
+        self._toast_job = self.root.after(duration, lambda: self.toast.configure(text=""))
+
+    def _install_dark_check(self, style):
+        """把 ttk.Checkbutton 指示器换成随 DPI 重绘的方框 + 对勾。"""
+        size = _sp(14)
+        border = max(1, round(size / 14))
+
         def box(color):
-            img = tk.PhotoImage(width=14, height=14)
-            img.put(PANEL, to=(0, 0, 14, 14))
-            for i in range(14):
-                img.put(color, (i, 0))
-                img.put(color, (i, 13))
-                img.put(color, (0, i))
-                img.put(color, (13, i))
+            img = tk.PhotoImage(width=size, height=size)
+            img.put(PANEL, to=(0, 0, size, size))
+            for i in range(size):
+                for b in range(border):
+                    img.put(color, (i, b))
+                    img.put(color, (i, size - 1 - b))
+                    img.put(color, (b, i))
+                    img.put(color, (size - 1 - b, i))
             return img
 
         off = box("#4a4a52")
         on = box(ACCENT)
+        scale = size / 14.0
         for x, y in [(2, 7), (3, 8), (4, 9), (5, 10), (6, 9), (7, 8),
                      (8, 7), (9, 6), (10, 5), (11, 4)]:
-            on.put(ACCENT, (x, y))
-            on.put(ACCENT, (x, y - 1))
+            px, py = round(x * scale), round(y * scale)
+            dot = max(1, border)
+            on.put(ACCENT, to=(px, py, min(size, px + dot), min(size, py + dot)))
+            on.put(ACCENT, to=(px, max(0, py - dot),
+                               min(size, px + dot), py))
 
         self._ck_images = (off, on)   # 必须留引用，否则图片会被回收
         try:
@@ -422,8 +718,8 @@ class MonitorApp:
         self.alive = True
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.reader.start()
-        self.connect_btn.configure(text="断开")
-        self.status.configure(text=f"已连接 {device} @ {baud}", style="Muted.TLabel")
+        self.connect_btn.configure(text="等待应答")
+        self._set_status(f"已连接 {device} @ {baud} · 等待设备", "warn")
         self._log(f"已连接 {device} @ {baud}")
         self.await_pong = time.time()
         self._send("PING")
@@ -438,10 +734,11 @@ class MonitorApp:
                 pass
         self.ser = None
         self.active_baud = 0
-        self.connect_btn.configure(text="连接")
-        self.status.configure(text="未连接", style="Muted.TLabel")
+        self.connect_btn.configure(text="连接设备")
+        self._set_status("未连接", "muted")
         if not silent:
             self._log("已断开")
+            self._notify("连接已断开", MUTED)
 
     def _read_loop(self):
         while self.alive and self.ser is not None:
@@ -456,6 +753,7 @@ class MonitorApp:
     def _send_bytes(self, data, label=None):
         if self.ser is None:
             self._log("! 未连接，无法发送")
+            self._notify("当前未连接设备", WARN)
             return False
         try:
             self.ser.write(data)
@@ -464,6 +762,7 @@ class MonitorApp:
             return True
         except Exception as exc:  # noqa: BLE001
             self._log(f"! 发送失败: {exc}")
+            self._notify("发送失败", DANGER)
             return False
 
     def _send(self, text):
@@ -609,7 +908,7 @@ class MonitorApp:
         c.delete("all")
         w = c.winfo_width()
         h = c.winfo_height()
-        if w < 150 or h < 80:
+        if w < _sp(150) or h < _sp(80):
             return
 
         d = self.sys.snapshot() if self.sys is not None else None
@@ -640,43 +939,58 @@ class MonitorApp:
         fps_ratio = clamp(d["fps"] / hz * 100.0) / 100.0 if d["fps"] >= 0 else 0.0
 
         items = [
-            ("CPU", clamp(cpu) / 100.0, "%d%%" % cpu, cpu_sub, "#4ecdc4", 13),
+            ("CPU", clamp(cpu) / 100.0, "%d%%" % cpu, cpu_sub, True, 13),
             ("GPU", clamp(gpu) / 100.0 if gpu >= 0 else 0.0,
-             "%d%%" % gpu if gpu >= 0 else "--", gpu_sub, "#ffa94d", 13),
+             "%d%%" % gpu if gpu >= 0 else "--", gpu_sub, gpu >= 0, 13),
             ("RAM", clamp(mem) / 100.0, "%d%%" % mem,
-             "%.1f/%.0fG" % (d["ram_used"], d["ram_total"]), "#a78bfa", 13),
+             "%.1f/%.0fG" % (d["ram_used"], d["ram_total"]), True, 13),
             ("NET", min(1.0, net_ratio), "↓" + _fmt_speed(d["net_down"]),
-             "↑" + _fmt_speed(d["net_up"]) + "/s", "#6ee7b7", 11),
+             "↑" + _fmt_speed(d["net_up"]) + "/s", True, 11),
             ("FPS", min(1.0, fps_ratio), "%d" % d["fps"] if d["fps"] >= 0 else "--",
-             "%dHz" % d["hz"] if d["hz"] > 0 else "--", "#e6e6e6", 15),
+             "%dHz" % d["hz"] if d["hz"] > 0 else "--", d["fps"] >= 0, 15),
         ]
 
         slot = w / float(len(items))
-        r = 38.0
-        if h < 140:
-            r = max(22.0, (h - 46) / 2.0)
-        cy = 14 + 10 + r
-        sub_y = cy + r + 14
+        r = float(_sp(38))
+        if h < _sp(140):
+            r = max(float(_sp(22)), (h - _sp(46)) / 2.0)
+        cy = _sp(14) + _sp(10) + r
+        sub_y = cy + r + _sp(14)
+        ring_width = max(2, _sp(7))
 
-        for idx, (name, ratio, center, sub, color, fsize) in enumerate(items):
+        for idx, (name, ratio, center, sub, available, fsize) in enumerate(items):
             cx = slot * (idx + 0.5)
             box = (cx - r, cy - r, cx + r, cy + r)
+            if not available:
+                color = "#4a5967"
+            elif name == "FPS":
+                # FPS 越高越好，不应该按负载阈值变红。
+                color = ACCENT
+            elif ratio >= 0.88:
+                color = DANGER
+            elif ratio >= 0.72:
+                color = WARN
+            else:
+                color = ACCENT
 
-            c.create_text(cx, 14, text=name, fill=MUTED, font=("Consolas", 9))
+            c.create_text(cx, _sp(14), text=name, fill=MUTED,
+                          font=("Consolas", 9))
 
             # 底槽
             c.create_oval(box[0], box[1], box[2], box[3],
-                          outline="#3a3a42", width=7)
+                          outline=BORDER, width=ring_width)
 
             # 进度弧：从 12 点方向顺时针
             if ratio > 0.004:
                 c.create_arc(box[0], box[1], box[2], box[3],
                              start=90, extent=-ratio * 359.9,
-                             style="arc", outline=color, width=7)
+                             style="arc", outline=color, width=ring_width)
 
-            c.create_text(cx, cy, text=center, fill=FG,
+            c.create_text(cx, cy, text=center,
+                          fill=FG if available else MUTED,
                           font=("Consolas", fsize, "bold"))
-            c.create_text(cx, sub_y, text=sub, fill=MUTED, font=("Consolas", 8))
+            c.create_text(cx, sub_y, text=sub, fill=MUTED,
+                          font=("Consolas", 9))
 
     def _clear_log(self):
         self.log.configure(state="normal")
@@ -700,7 +1014,8 @@ class MonitorApp:
         if self.await_pong and time.time() - self.await_pong > 1.5:
             self.await_pong = 0.0
             self._log("! 未收到 +PONG：检查设备是否上电、波特率是否一致")
-            self.status.configure(text="已连接，无应答", style="Warn.TLabel")
+            self._set_status("已连接，无应答", "warn")
+            self._notify("设备未响应，请检查连接", WARN)
 
         # 等设备确认 BAUD 超时：保持原速率，避免自己把链路弄断
         if self.pending_baud and time.time() > self.baud_deadline:
@@ -756,9 +1071,16 @@ class MonitorApp:
         if not line.startswith("$R,"):
             self._log(f"< {line}")
 
+        if line.startswith("+OK"):
+            self._notify("设备已确认", ACCENT)
+        elif line.startswith("-ERR"):
+            self._notify("命令执行失败", DANGER)
+
         if line.startswith("+PONG"):
             self.await_pong = 0.0
-            self.status.configure(text=f"在线 @ {self.active_baud}", style="Muted.TLabel")
+            self.connect_btn.configure(text="断开连接")
+            self._set_status(f"在线 @ {self.active_baud}", "ok")
+            self._notify("设备连接成功", ACCENT)
 
         if line.startswith("+OK,BAUD") and self.pending_baud:
             target = self.pending_baud
@@ -853,8 +1175,8 @@ class MonitorApp:
         """
         c = self.gyro
         c.delete("all")
-        w = max(c.winfo_width(), 200)
-        h = max(c.winfo_height(), 110)
+        w = max(c.winfo_width(), _sp(200))
+        h = max(c.winfo_height(), _sp(110))
 
         if not self.got_data:
             c.create_text(w / 2, h / 2, text="等待陀螺仪数据…", fill=MUTED)
@@ -865,18 +1187,21 @@ class MonitorApp:
 
         # ---- 姿态气泡 ----
         r = min(h * 0.30, w * 0.15)
-        cx, cy = r + 10, mid_y
-        c.create_oval(cx - r, cy - r, cx + r, cy + r, outline="#4a4a52", width=2)
+        cx, cy = r + _sp(10), mid_y
+        c.create_oval(cx - r, cy - r, cx + r, cy + r, outline="#4a4a52",
+                      width=max(1, _sp(2)))
         c.create_oval(cx - r * 0.55, cy - r * 0.55, cx + r * 0.55, cy + r * 0.55,
                       outline="#33333a")
-        c.create_line(cx - r, cy, cx + r, cy, fill="#3a3a42")
-        c.create_line(cx, cy - r, cx, cy + r, fill="#3a3a42")
+        c.create_line(cx - r, cy, cx + r, cy, fill=BORDER)
+        c.create_line(cx, cy - r, cx, cy + r, fill=BORDER)
 
         roll, pitch = d["roll"], d["pitch"]
         bx = cx + max(-1.0, min(1.0, roll / 45.0)) * r * 0.62
         by = cy - max(-1.0, min(1.0, pitch / 45.0)) * r * 0.62
-        c.create_oval(bx - 7, by - 7, bx + 7, by + 7, fill=ACCENT, outline="")
-        c.create_text(4, h - 10, text=f"R{roll:+.1f}  P{pitch:+.1f}",
+        dot = _sp(7)
+        c.create_oval(bx - dot, by - dot, bx + dot, by + dot,
+                      fill=ACCENT, outline="")
+        c.create_text(_sp(4), h - _sp(10), text=f"R{roll:+.1f}  P{pitch:+.1f}",
                       fill=MUTED, anchor="w", font=("Consolas", 9))
 
         # ---- 三轴角速度条 ----
@@ -884,21 +1209,22 @@ class MonitorApp:
         x1 = w * 0.80
         mid = (x0 + x1) / 2
         span = x1 - x0
-        spacing = max(min(66.0, (h - 80.0) / 2.0), 22.0)
+        spacing = max(min(float(_sp(66)), (h - _sp(80)) / 2.0), float(_sp(22)))
 
         for i, (name, val) in enumerate((("Gx", d["gx"]), ("Gy", d["gy"]), ("Gz", d["gz"]))):
             y = mid_y + (i - 1) * spacing
-            c.create_text(x0 - 7, y, text=name, fill=MUTED, anchor="e",
+            c.create_text(x0 - _sp(7), y, text=name, fill=MUTED, anchor="e",
                           font=("Consolas", 9))
-            c.create_line(x0, y, x1, y, fill="#3a3a42")
-            c.create_line(mid, y - 7, mid, y + 7, fill="#55555e")
+            c.create_line(x0, y, x1, y, fill=BORDER)
+            tick = _sp(7)
+            c.create_line(mid, y - tick, mid, y + tick, fill=MUTED)
             frac = max(-1.0, min(1.0, val / 250.0))
             ex = mid + frac * span / 2
             mag = abs(val)
-            color = ACCENT if mag < 20 else (WARN if mag < 150 else "#e24b4a")
+            color = ACCENT if mag < 20 else (WARN if mag < 150 else DANGER)
             if abs(ex - mid) >= 1:
-                c.create_line(mid, y, ex, y, fill=color, width=6)
-            c.create_text(w - 5, y, text=f"{val:+d}", fill=FG, anchor="e",
+                c.create_line(mid, y, ex, y, fill=color, width=max(2, _sp(6)))
+            c.create_text(w - _sp(5), y, text=f"{val:+d}", fill=FG, anchor="e",
                           font=("Consolas", 9))
 
     @staticmethod
@@ -930,16 +1256,16 @@ class MonitorApp:
         """
         c = self.radar
         c.delete("all")
-        w = max(c.winfo_width(), 220)
-        h = max(c.winfo_height(), 110)
+        w = max(c.winfo_width(), _sp(220))
+        h = max(c.winfo_height(), _sp(110))
 
         # 半径要给刻度标签留位置：标签画在 r+10 处，90° 那个会顶到画布上沿
-        r = min(h - 40, (w - 64) / 2)
-        if r < 30:
+        r = min(h - _sp(40), (w - _sp(64)) / 2)
+        if r < _sp(30):
             c.create_text(w / 2, h / 2, text="视图太小", fill=MUTED)
             return
         cx = w / 2
-        cy = h - 18
+        cy = h - _sp(18)
 
         # 距离环
         for frac in (0.25, 0.5, 0.75, 1.0):
@@ -952,17 +1278,20 @@ class MonitorApp:
             th = math.radians(a)
             c.create_line(cx, cy, cx - r * math.cos(th), cy - r * math.sin(th),
                           fill="#2c2c33")
-            c.create_text(cx - (r + 10) * math.cos(th), cy - (r + 10) * math.sin(th),
-                          text=str(a), fill="#55555e", font=("Consolas", 8))
+            c.create_text(cx - (r + _sp(10)) * math.cos(th),
+                          cy - (r + _sp(10)) * math.sin(th),
+                          text=str(a), fill=MUTED, font=("Consolas", 9))
 
         # 回波点
+        point_r = _sp(2)
         for ang, dist in self.radar_pts.items():
             rr = r * min(dist / float(RADAR_MAX_CM), 1.0)
             th = math.radians(ang)
             x = cx - rr * math.cos(th)
             y = cy - rr * math.sin(th)
             color = ACCENT if dist < RADAR_MAX_CM * 0.6 else WARN
-            c.create_oval(x - 2, y - 2, x + 2, y + 2, fill=color, outline="")
+            c.create_oval(x - point_r, y - point_r, x + point_r, y + point_r,
+                          fill=color, outline="")
 
         # 扫描线拖尾：越靠后越接近背景色
         sign = 1.0 if self.radar_disp >= self.radar_prev else -1.0
@@ -972,25 +1301,28 @@ class MonitorApp:
                 continue
             th = math.radians(a)
             c.create_line(cx, cy, cx - r * math.cos(th), cy - r * math.sin(th),
-                          fill=self._blend(PANEL, ACCENT, 1.0 - k / float(RADAR_TRAIL + 1)))
+                          fill=self._blend(PANEL_ALT, ACCENT,
+                                           1.0 - k / float(RADAR_TRAIL + 1)))
 
         # 当前扫描线
         th = math.radians(self.radar_disp)
         c.create_line(cx, cy, cx - r * math.cos(th), cy - r * math.sin(th),
-                      fill=ACCENT, width=2)
-        c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=ACCENT, outline="")
+                      fill=ACCENT, width=max(1, _sp(2)))
+        center_r = _sp(3)
+        c.create_oval(cx - center_r, cy - center_r, cx + center_r, cy + center_r,
+                      fill=ACCENT, outline="")
 
         # 读数
-        c.create_text(8, 10, text=f"角度 {self.radar_disp:5.1f}°", fill=FG, anchor="w",
-                      font=("Microsoft YaHei UI", 10))
-        c.create_text(w - 8, 10, text=f"量程 {RADAR_MAX_CM}cm", fill=MUTED, anchor="e",
-                      font=("Consolas", 8))
+        c.create_text(_sp(8), _sp(10), text=f"角度 {self.radar_disp:5.1f}°",
+                      fill=FG, anchor="w", font=(FONT_UI, 10))
+        c.create_text(w - _sp(8), _sp(10), text=f"量程 {RADAR_MAX_CM}cm",
+                      fill=MUTED, anchor="e", font=("Consolas", 9))
         dist_txt = f"{self.radar_last_dist} cm" if self.radar_last_dist >= 0 else "---"
-        c.create_text(8, h - 10, text=f"距离 {dist_txt}", fill=MUTED, anchor="w",
-                      font=("Microsoft YaHei UI", 9))
+        c.create_text(_sp(8), h - _sp(10), text=f"距离 {dist_txt}",
+                      fill=MUTED, anchor="w", font=(FONT_UI, 10))
 
         if not self.radar_pts:
-            c.create_text(cx, cy - r * 0.55, text="等待回波…", fill="#55555e")
+            c.create_text(cx, cy - r * 0.55, text="等待回波…", fill=MUTED)
 
     def _push_history(self, value):
         self.history.append(value)
@@ -1001,8 +1333,8 @@ class MonitorApp:
     def _draw_chart(self):
         c = self.canvas
         c.delete("all")
-        w = max(c.winfo_width(), 200)
-        h = max(c.winfo_height(), 100)
+        w = max(c.winfo_width(), _sp(200))
+        h = max(c.winfo_height(), _sp(100))
         if len(self.history) < 2:
             c.create_text(w // 2, h // 2, text="等待数据…", fill=MUTED)
             return
@@ -1014,11 +1346,11 @@ class MonitorApp:
         pts = []
         for i, v in enumerate(self.history):
             x = i * step
-            y = h - 12 - (v - lo) / (hi - lo) * (h - 28)
+            y = h - _sp(12) - (v - lo) / (hi - lo) * (h - _sp(28))
             pts.extend([x, y])
-        c.create_line(*pts, fill=ACCENT, width=2, smooth=True)
-        c.create_text(6, 8, text=f"{hi:.1f}", fill=MUTED, anchor="w")
-        c.create_text(6, h - 8, text=f"{lo:.1f}", fill=MUTED, anchor="w")
+        c.create_line(*pts, fill=ACCENT, width=max(1, _sp(2)), smooth=True)
+        c.create_text(_sp(6), _sp(8), text=f"{hi:.1f}", fill=MUTED, anchor="w")
+        c.create_text(_sp(6), h - _sp(8), text=f"{lo:.1f}", fill=MUTED, anchor="w")
 
     def _log(self, text):
         # 界面构建过程中可能就会打日志，此时 ts_var 还不存在
@@ -1037,6 +1369,7 @@ class MonitorApp:
 
 
 if __name__ == "__main__":
+    enable_dpi_awareness()
     root = tk.Tk()
     app = MonitorApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)

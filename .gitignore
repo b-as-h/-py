@@ -16,3 +16,6 @@ dist_dbg/
 # 系统
 Thumbs.db
 desktop.ini
+
+# WorkBuddy 本地数据（禁止提交）
+.workbuddy/
